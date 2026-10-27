@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Desktop Launcher</string>
+    <string name="access_desc">Lets Desktop Launcher keep its taskbar and use Back, Home, and Recents while other apps are open.</string>
+</resources>
