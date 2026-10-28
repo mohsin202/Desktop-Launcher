@@ -1,27 +1,36 @@
-# Desktop Launcher (Android)
+# Desktop Launcher
 
-Android source project for `com.android.desktoplauncher`.
+Package: `com.android.desktoplauncher` — Min SDK 31 (Android 12), Target 37 (Android 17).
+Plain Android views, **no external libraries** (no AndroidX / Compose), so the build is small and simple.
+
+## Features
+- Desktop = the `/sdcard/Desktop` folder (files, folders, app shortcuts, widgets)
+- Right-click / long-press menu: View (Small/Normal/Large), Cut, Copy, Paste, New (File/Folder), Wallpapers, Widgets, Settings
+- Cut / Copy / Paste are faint until something is selected or copied
+- Item menu: Open, Cut, Copy, Share, Remove, Delete (apps: Open, App Info, Share, Remove, Uninstall)
+- Folders open in the file manager, files open in the proper app
+- App drawer (rounded panel bottom-left) with universal search: apps, settings, app shortcuts, contacts, files, in-app search, web
+- Drawer long-press menu: Open, App Info, Share, Pin to Taskbar, Add to Desktop, Uninstall
+- Two layouts like Launcher3: smallest width < 600 dp = phone (dock on the home screen, icons in rows, swipe up for the drawer); 600 dp or more = desktop (dock merges into the taskbar, icons in columns). Can be forced in Settings.
+- Icons can be dragged to any free cell (swap if occupied)
+- Language switch icon on the taskbar while a keyboard is in use; Windows key opens the drawer
+- Optional UI blur (Settings -> Enable UI blur), otherwise solid Material You colours
+- Taskbar in an accessibility overlay: shown over every app (fullscreen and windowed), start button, pinned + running apps, Back / Home / Recents, clock
+- Settings: icon size, themed drawer icons, notification dots, taskbar options
 
 ## Build on GitHub
+Upload everything (keep the folder structure), open **Actions -> Build APK -> Run workflow**, download the `DesktopLauncher` artifact.
 
-1. Upload/push the contents of this folder to a GitHub repository.
-2. Open **Actions** and run **Build APK** (or push a commit).
-3. Download the `DesktopLauncher` artifact from the completed workflow.
+## First run
+1. Install the APK, press Home and choose **Desktop Launcher** -> Always.
+2. Settings -> Accessibility -> **Desktop Launcher taskbar** -> On (starts the taskbar).
+3. Allow **All files access** and **Notification access** (Settings screen has buttons).
 
-The workflow currently builds a debug APK using Android SDK 35, which is a conservative
-build baseline. The app's `targetSdk` and `compileSdk` can be overridden with Gradle
-properties `desktop.targetSdk` and `desktop.compileSdk`; changing them to 37 requires
-an installed Android 17 SDK platform and a compatible Android Gradle Plugin/toolchain.
+If Android blocks the accessibility toggle (restricted setting) run as root:
+`appops set com.android.desktoplauncher ACCESS_RESTRICTED_SETTINGS allow`
 
-## Important platform limitations
-
-- The overlay taskbar requires the user to grant **Display over other apps** permission.
-- Back/Home/Recents overlay buttons require the user to enable the app's accessibility
-  service. Android/OEM policy can still limit overlay behavior.
-- A third-party app cannot replace BassOS/Launcher3's privileged navigation-bar taskbar
-  integration. This implementation uses an overlay as a best-effort alternative and
-  may not be identical to the built-in BassOS taskbar.
-- Freeform/windowed launch is OEM/system dependent. The source now attempts to request
-  freeform mode reflectively when the Android build exposes that API; otherwise it falls
-  back to a normal app launch.
-- The `attachments` folder from the supplied workspace was empty and is not included.
+## Phone / tablet behaviour (same rule as Launcher3)
+- Smallest width **< 600 dp**: normal launcher. Floating dock at the bottom of the home screen, icons fill rows.
+- Smallest width **>= 600 dp**: the dock merges into the taskbar (accessibility overlay, over every app, fullscreen or windowed),
+  Back/Home/Recents move into it, desktop icons fill columns.
+- Both layouts use the same desktop-style taskbar look. Colours follow the wallpaper (Material You, Android 12+).
