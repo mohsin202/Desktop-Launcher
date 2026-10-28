@@ -375,16 +375,16 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         }
 
         out += Result(true, "In apps")
-        for ((label, intentFn) in inAppSearches(q)) out += Result(false, label, "") { Launch.start(c, intentFn()) }
+        for ((label, intentFn) in inAppSearches(q)) out += Result(false, label, "", action = { Launch.start(c, intentFn()) })
 
         out += Result(true, "Web")
-        out += Result(false, "Search the web for “$q”", "") {
+        out += Result(false, "Search the web for “$q”", "", action = {
             val i = Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, q)
             try { c.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
             catch (_: Exception) {
                 Launch.start(c, Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))))
             }
-        }
+        })
         return out
     }
 
