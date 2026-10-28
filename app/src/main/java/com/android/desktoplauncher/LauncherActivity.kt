@@ -1,0 +1,266 @@
+package com.android.desktoplauncher
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.appwidget.AppWidgetHost
+import android.appwidget.AppWidgetManager
+import android.appwidget.AppWidgetProviderInfo
+import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.Color
+import android.net.Uri
+import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
+import android.view.Gravity
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.WindowInsets
+import android.widget.FrameLayout
+import android.widget.TextView
+
+class LauncherActivity : Activity() {
+    companion object {
+        const val ACTION_TOGGLE_DRAWER = "com.android.desktoplauncher.TOGGLE_DRAWER"
+        private const val REQ_BIND = 11
+        private const val REQ_CONFIG = 12
+        private const val HOST_ID = 1024
+    }
+
+    private lateinit var root: FrameLayout
+    private lateinit var desktop: DesktopView
+    private lateinit var banner: TextView
+    lateinit var host: AppWidgetHost
+    lateinit var awm: AppWidgetManager
+    private var drawer: DrawerView? = null
+    private var dock: TaskbarView? = null
+    private var dockH = 0
+    private var padTop = 0
+    private var padBottom = 0
+    private var pendingId = -1
+    private var pendingInfo: AppWidgetProviderInfo? = null
+    private var pendX = 300
+    private var pendY = 300
+    private val busListener: () -> Unit = { applyMode() }
+
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        window.setDecorFitsSystemWindows(false)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        host = AppWidgetHost(this, HOST_ID)
+        awm = AppWidgetManager.getInstance(this)
+
+        root = FrameLayout(this)
+        desktop = DesktopView(this)
+        root.addView(desktop, FrameLayout.LayoutParams(MATCH, MATCH))
+        banner = TextView(this)
+        banner.setTextColor(Color.WHITE)
+        banner.textSize = 13f
+        banner.setPadding(dp(14), dp(8), dp(14), dp(8))
+        banner.background = Colors.rounded(0xCC222222.toInt(), dp(18).toFloat())
+        banner.visibility = android.view.View.GONE
+        root.addView(banner, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.END).also {
+            it.topMargin = dp(48); it.rightMargin = dp(12)
+        })
+        setContentView(root)
+        root.setOnApplyWindowInsetsListener { _, ins ->
+            val bars = ins.getInsets(WindowInsets.Type.systemBars())
+            padTop = bars.top
+            padBottom = bars.bottom
+            applyPadding()
+            ins
+        }
+        Bus.add(busListener)
+    }
+
+    override fun onDestroy() {
+        Bus.remove(busListener)
+        super.onDestroy()
+    }
+
+    private val dockHost = object : TaskbarHost {
+        override val running: Collection<String> = emptyList()
+        override val focused: String? = null
+        override fun global(action: Int) {}
+        override fun hideRunning(pkg: String) {}
+        override fun toggleDrawer() { this@LauncherActivity.toggleDrawer() }
+        override val imeShown = false
+        override fun pickIme() {}
+    }
+
+    private fun barOn() = Prefs.bool(this, Prefs.K_TASKBAR, true)
+
+    /** Phone (<600dp): normal dock on the home screen. Tablet (>=600dp): dock merges into the taskbar overlay. */
+    private fun applyMode() {
+        val phone = !Modes.tablet(this)
+        if (phone && barOn()) {
+            dockH = dp(Prefs.tbDp(this)) + dp(4)
+            if (dock == null) {
+                val d = TaskbarView(this, dockHost, false, true)
+                root.addView(d, FrameLayout.LayoutParams(MATCH, dockH, Gravity.BOTTOM))
+                dock = d
+            } else dock?.refresh()
+        } else {
+            dock?.let { root.removeView(it) }
+            dock = null
+            dockH = 0
+        }
+        applyPadding()
+        desktop.reload()
+    }
+
+    private fun applyPadding() {
+        val phone = !Modes.tablet(this)
+        val bottom = when {
+            phone && barOn() -> padBottom + dockH + dp(16)
+            !phone && barOn() && TaskbarService.instance != null -> maxOf(padBottom, dp(Prefs.tbDp(this)))
+            else -> padBottom
+        }
+        desktop.setPadding(0, padTop, 0, bottom)
+        dock?.let {
+            val lp = it.layoutParams as FrameLayout.LayoutParams
+            lp.height = dockH
+            lp.leftMargin = dp(16); lp.rightMargin = dp(16); lp.bottomMargin = padBottom + dp(8)
+            it.layoutParams = lp
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        try { host.startListening() } catch (_: Exception) {}
+    }
+
+    override fun onStop() {
+        try { host.stopListening() } catch (_: Exception) {}
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        applyMode()
+        updateBanner()
+    }
+
+    private fun updateBanner() {
+        if (!Environment.isExternalStorageManager()) {
+            banner.text = "Tap: allow file access for the Desktop folder"
+            banner.setOnClickListener {
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+                } catch (_: Exception) {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                }
+            }
+            banner.visibility = android.view.View.VISIBLE
+        } else if (Modes.tablet(this) && barOn() && TaskbarService.instance == null) {
+            banner.text = "Tap: turn on Accessibility to show the taskbar"
+            banner.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+            banner.visibility = android.view.View.VISIBLE
+        } else banner.visibility = android.view.View.GONE
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == ACTION_TOGGLE_DRAWER) toggleDrawer()
+        else { closeDrawer(); TaskbarService.instance?.closeDrawer(); desktop.clearSelection() }
+    }
+
+    override fun onConfigurationChanged(c: Configuration) {
+        super.onConfigurationChanged(c)
+        closeDrawer()
+        applyMode()
+        Bus.fire()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() { if (drawer != null) closeDrawer() }
+
+    fun toggleDrawer() {
+        val svc = TaskbarService.instance
+        if (svc != null && Modes.tablet(this) && barOn()) { svc.toggleDrawer(); return }
+        if (drawer != null) closeDrawer() else {
+            val bm = if (!Modes.tablet(this) && barOn()) padBottom + dockH + dp(16) else padBottom + dp(8)
+            val d = DrawerView(this, bm, !Modes.tablet(this)) { closeDrawer() }
+            root.addView(d, FrameLayout.LayoutParams(MATCH, MATCH))
+            drawer = d
+            d.post { d.onShown() }
+        }
+    }
+
+    fun closeDrawer() {
+        drawer?.let { root.removeView(it) }
+        drawer = null
+        TaskbarService.instance?.closeDrawer()
+    }
+
+    // ------------------------------------------------------------ widgets
+
+    fun pickWidget(x: Int, y: Int) {
+        pendX = x; pendY = y
+        val pm = packageManager
+        val all = awm.installedProviders.sortedBy { it.loadLabel(pm).lowercase() }
+        val names = all.map { p ->
+            val app = try { pm.getApplicationLabel(pm.getApplicationInfo(p.provider.packageName, 0)).toString() } catch (_: Exception) { "" }
+            "${p.loadLabel(pm)}  —  $app"
+        }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("Widgets").setItems(names) { _, i -> startAdd(all[i]) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun startAdd(info: AppWidgetProviderInfo) {
+        val id = host.allocateAppWidgetId()
+        if (awm.bindAppWidgetIdIfAllowed(id, info.provider)) configureOrFinish(id, info)
+        else {
+            pendingId = id; pendingInfo = info
+            val i = Intent(AppWidgetManager.ACTION_APPWIDGET_BIND)
+                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_PROVIDER, info.provider)
+            try { startActivityForResult(i, REQ_BIND) } catch (_: Exception) { host.deleteAppWidgetId(id); toast("Cannot bind widget") }
+        }
+    }
+
+    private fun configureOrFinish(id: Int, info: AppWidgetProviderInfo) {
+        pendingId = id; pendingInfo = info
+        if (info.configure != null) {
+            try { host.startAppWidgetConfigureActivityForResult(this, id, 0, REQ_CONFIG, null) }
+            catch (_: Exception) { desktop.addWidget(id, info, pendX, pendY) }
+        } else desktop.addWidget(id, info, pendX, pendY)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        super.onActivityResult(req, res, data)
+        val info = pendingInfo
+        when (req) {
+            REQ_BIND -> if (res == RESULT_OK && info != null) configureOrFinish(pendingId, info)
+                        else if (pendingId != -1) host.deleteAppWidgetId(pendingId)
+            REQ_CONFIG -> if (res == RESULT_OK && info != null) desktop.addWidget(pendingId, info, pendX, pendY)
+                          else if (pendingId != -1) host.deleteAppWidgetId(pendingId)
+        }
+    }
+
+    private val swipe = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+        override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+            if (e1 == null || Modes.tablet(this@LauncherActivity) || drawer != null) return false
+            val dy = e1.y - e2.y
+            if (dy > dp(90) && vy < -900f && Math.abs(vy) > Math.abs(vx)) { toggleDrawer(); return true }
+            return false
+        }
+    })
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        swipe.onTouchEvent(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun dispatchKeyEvent(e: KeyEvent): Boolean {
+        // Windows key / Meta opens the drawer.
+        if (e.keyCode == KeyEvent.KEYCODE_META_LEFT || e.keyCode == KeyEvent.KEYCODE_META_RIGHT) {
+            if (e.action == KeyEvent.ACTION_UP) toggleDrawer()
+            return true
+        }
+        return super.dispatchKeyEvent(e)
+    }
+}
