@@ -12,16 +12,21 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v4
-      - name: SDK platform
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK (API 37, falls back to 36)
         run: |
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          if sdkmanager "platforms;android-37.0" "build-tools;37.0.0"; then
+            echo "SDKV=37" >> "$GITHUB_ENV"
+          else
+            sdkmanager "platforms;android-36" "build-tools;36.0.0"
+            echo "SDKV=36" >> "$GITHUB_ENV"
+          fi
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.11.1"
-      - name: Assemble debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+          gradle-version: "8.13"
+      - name: Build APK
+        run: gradle :app:assembleDebug -Pdesktop.sdk=$SDKV --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4
         with:
           name: DesktopLauncher
