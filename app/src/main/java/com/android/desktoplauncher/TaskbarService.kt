@@ -280,7 +280,7 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
             isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
             clipToPadding = false
-            addView(appsRow, android.widget.HorizontalScrollView.LayoutParams(WRAP, MATCH))
+            addView(appsRow, FrameLayout.LayoutParams(WRAP, MATCH))
         }
         center.addView(scroll, LinearLayout.LayoutParams(0, MATCH, 1f))
         val navCount = if (showNav && Prefs.bool(ctx, Prefs.K_NAV, true)) 3 else 0
