@@ -9,6 +9,13 @@ import android.view.View.LAYOUT_DIRECTION_RTL
 object UiText {
     private val ur = mapOf(
         "Desktop Launcher" to "ڈیسک ٹاپ لانچر", "Settings" to "ترتیبات", "ICONS" to "آئیکنز",
+        "Choose language and reading direction" to "زبان اور پڑھنے کی سمت منتخب کریں",
+        "Icon size and app appearance" to "آئیکنز کا سائز اور ایپس کی ظاہری شکل",
+        "Phone or desktop layout" to "فون یا ڈیسک ٹاپ لے آؤٹ",
+        "Colours, blur and drawer behaviour" to "رنگ، بلر اور ایپ ڈراور کا انداز",
+        "Taskbar, dock and navigation controls" to "ٹاسک بار، ڈوک اور نیویگیشن کنٹرولز",
+        "Access needed by launcher features" to "لانچر کی سہولتوں کے لیے درکار اجازتیں",
+        "Desktop items and wallpaper" to "ڈیسک ٹاپ کی اشیا اور وال پیپر",
         "Small" to "چھوٹے", "Normal" to "درمیانے", "Large" to "بڑے",
         "App drawer themed icons" to "ایپ ڈراور میں تھیم والے آئیکنز", "Uses the wallpaper colours for apps that provide a monochrome icon (Android 13+)." to "وال پیپر کے رنگ ان ایپس پر استعمال ہوں گے جو مونوکروم آئیکن فراہم کرتی ہیں (Android 13+).",
         "Show notification dots" to "نوٹیفکیشن ڈاٹس دکھائیں", "Allow notification access (needed for dots)" to "نوٹیفکیشن رسائی دیں (ڈاٹس کے لیے ضروری)",
@@ -27,7 +34,7 @@ object UiText {
         "Set as default home app" to "ڈیفالٹ ہوم ایپ مقرر کریں", "All files access: allowed" to "تمام فائلوں کی رسائی: اجازت ہے", "Allow all files access (Desktop folder)" to "تمام فائلوں کی رسائی دیں (ڈیسک ٹاپ فولڈر)",
         "Contacts search: allowed" to "رابطوں کی تلاش: اجازت ہے", "Allow contacts (for search)" to "رابطوں کی اجازت دیں (تلاش کے لیے)",
         "Smallest width" to "کم سے کم چوڑائی", "tablet mode: the dock is merged into the taskbar (over all apps)." to "ٹیبلٹ موڈ: ڈوک تمام ایپس کے اوپر ٹاسک بار میں شامل ہے۔", "phone mode: normal dock on the home screen. At 600 dp or more the dock becomes the taskbar." to "فون موڈ: ہوم اسکرین پر عام ڈوک۔ 600 dp یا زیادہ پر ڈوک ٹاسک بار بن جاتا ہے۔",
-        "Open Desktop folder" to "ڈیسک ٹاپ فولڈر کھولیں", "Search the web" to "ویب پر تلاش کریں"
+        "Open Desktop folder" to "ڈیسک ٹاپ فولڈر کھولیں", "Search the web" to "ویب پر تلاش کریں", "Hide all files" to "تمام فائلیں چھپائیں", "Show only the first 5 results" to "صرف پہلی 5 فائلیں دکھائیں", "Show all matching results" to "تمام ملتے جلتے نتائج دکھائیں", "Include" to "شامل کریں", "No widgets found" to "کوئی ویجیٹ نہیں ملا", "Cancel" to "منسوخ کریں"
     )
     fun text(c: Context, english: String): String = if (Prefs.language(c) == 1) ur[english] ?: english else english
     fun applyDirection(v: View, c: Context) {

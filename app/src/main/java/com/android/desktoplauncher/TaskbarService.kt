@@ -20,6 +20,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextClock
 import android.view.ContextThemeWrapper
+import android.util.Log
 
 /**
  * Draws the desktop taskbar in an accessibility overlay window. The overlay is shown over every app,
@@ -53,11 +54,18 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
     private val listener: () -> Unit = { sync() }
 
     override fun onServiceConnected() {
-        instance = this
-        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        uctx = ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault)
-        Bus.add(listener)
-        sync()
+        super.onServiceConnected()
+        try {
+            instance = this
+            wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            uctx = ContextThemeWrapper(this, android.R.style.Theme_DeviceDefault)
+            Bus.add(listener)
+            sync()
+        } catch (e: Exception) {
+            Log.e("DesktopTaskbar", "Taskbar service failed to initialize", e)
+            removeBar()
+            if (instance === this) instance = null
+        }
     }
 
     override fun onDestroy() {
@@ -149,35 +157,53 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
 
     /** Re-reads preferences: adds/removes the bar and updates its size. */
     private fun sync() {
-        if (!Prefs.bool(this, Prefs.K_TASKBAR, true) || !Modes.tablet(this)) { removeBar(); closeDrawer(); return }
-        val b = bar
-        if (b == null) addBar() else {
-            val lp = b.layoutParams as WindowManager.LayoutParams
-            val h = uctx.dp(Prefs.tbDp(this))
-            lp.height = h
-            Blur.apply(lp, uctx, 24)
-            try { wm.updateViewLayout(b, lp) } catch (_: Exception) {}
-            b.refresh()
+        try {
+            if (!Prefs.bool(this, Prefs.K_TASKBAR, true) || !Modes.tablet(this)) {
+                removeBar(); closeDrawer(); return
+            }
+            val b = bar
+            if (b == null) addBar() else {
+                val lp = b.layoutParams as? WindowManager.LayoutParams
+                if (lp != null) {
+                    lp.height = uctx.dp(Prefs.tbDp(this))
+                    Blur.apply(lp, uctx, 24)
+                    try { wm.updateViewLayout(b, lp) } catch (t: Throwable) {
+                        Log.e("DesktopTaskbar", "Could not update taskbar window", t)
+                    }
+                }
+                b.refresh()
+            }
+        } catch (e: Exception) {
+            Log.e("DesktopTaskbar", "Taskbar sync failed", e)
+            removeBar()
         }
     }
 
     private fun addBar() {
-        val v = TaskbarView(uctx, this, true, false)
-        val lp = WindowManager.LayoutParams(
-            MATCH, uctx.dp(Prefs.tbDp(this)),
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        )
-        lp.gravity = Gravity.BOTTOM
-        lp.setFitInsetsTypes(0)
-        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        lp.title = "DesktopTaskbar"
-        Blur.apply(lp, uctx, 24)
-        try { wm.addView(v, lp); bar = v } catch (_: Exception) {}
+        var v: TaskbarView? = null
+        try {
+            v = TaskbarView(uctx, this, true, false)
+            val lp = WindowManager.LayoutParams(
+                MATCH, uctx.dp(Prefs.tbDp(this)),
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.BOTTOM
+            lp.setFitInsetsTypes(0)
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            lp.title = "DesktopTaskbar"
+            Blur.apply(lp, uctx, 24)
+            wm.addView(v, lp)
+            bar = v
+        } catch (e: Exception) {
+            Log.e("DesktopTaskbar", "Could not add taskbar overlay", e)
+            if (v != null) try { wm.removeView(v) } catch (_: Exception) {}
+            bar = null
+        }
     }
 
     private fun removeBar() {

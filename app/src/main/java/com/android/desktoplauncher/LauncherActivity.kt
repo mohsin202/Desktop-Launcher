@@ -1,13 +1,14 @@
 package com.android.desktoplauncher
 
 import android.app.Activity
-import android.app.AlertDialog
+import android.app.Dialog
 import android.appwidget.AppWidgetHost
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProviderInfo
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -18,6 +19,14 @@ import android.view.MotionEvent
 import android.view.WindowInsets
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.widget.EditText
+import android.widget.ImageView
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
 
 class LauncherActivity : Activity() {
     companion object {
@@ -205,13 +214,157 @@ class LauncherActivity : Activity() {
     fun pickWidget(x: Int, y: Int) {
         pendX = x; pendY = y
         val pm = packageManager
-        val all = awm.installedProviders.sortedBy { it.loadLabel(pm).lowercase() }
-        val names = all.map { p ->
-            val app = try { pm.getApplicationLabel(pm.getApplicationInfo(p.provider.packageName, 0)).toString() } catch (_: Exception) { "" }
-            "${p.loadLabel(pm)}  —  $app"
-        }.toTypedArray()
-        AlertDialog.Builder(this).setTitle("Widgets").setItems(names) { _, i -> startAdd(all[i]) }
-            .setNegativeButton("Cancel", null).show()
+        val all = try { awm.installedProviders.sortedBy { it.loadLabel(pm).toString().lowercase() } }
+                  catch (_: Exception) { emptyList() }
+        if (all.isEmpty()) { toast("No widgets available"); return }
+
+        var selected = all.first()
+        val dialog = Dialog(this)
+        val outer = FrameLayout(this).apply {
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = Colors.rounded(Colors.surfaceSolid(this@LauncherActivity), dp(30).toFloat())
+            setPadding(dp(18), dp(18), dp(18), dp(12))
+        }
+        outer.addView(panel, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        val search = EditText(this).apply {
+            hint = UiText.text(this@LauncherActivity, "Search")
+            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT
+            textSize = 16f
+            setTextColor(Colors.text(this@LauncherActivity))
+            setHintTextColor(Colors.text(this@LauncherActivity) and 0x88FFFFFF.toInt())
+            background = Colors.rounded(Colors.surfaceHigh(this@LauncherActivity), dp(28).toFloat())
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+        }
+        panel.addView(search, LinearLayout.LayoutParams(MATCH, dp(52)))
+
+        val selectedTitle = TextView(this).apply {
+            textSize = 20f
+            gravity = Gravity.CENTER
+            setTextColor(Colors.text(this@LauncherActivity))
+            setPadding(dp(4), dp(12), dp(4), dp(2))
+        }
+        panel.addView(selectedTitle, LinearLayout.LayoutParams(MATCH, WRAP))
+        val selectedApp = TextView(this).apply {
+            textSize = 13f
+            gravity = Gravity.CENTER
+            alpha = 0.72f
+            setTextColor(Colors.text(this@LauncherActivity))
+        }
+        panel.addView(selectedApp, LinearLayout.LayoutParams(MATCH, WRAP))
+        val preview = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setPadding(dp(12), dp(8), dp(12), dp(8)) }
+        panel.addView(preview, LinearLayout.LayoutParams(MATCH, dp(150)))
+        val sizeLabel = TextView(this).apply {
+            gravity = Gravity.CENTER
+            textSize = 13f
+            alpha = 0.7f
+            setTextColor(Colors.text(this@LauncherActivity))
+            setPadding(0, 0, 0, dp(8))
+        }
+        panel.addView(sizeLabel, LinearLayout.LayoutParams(MATCH, WRAP))
+        val include = Button(this).apply {
+            text = UiText.text(this@LauncherActivity, "Include")
+            isAllCaps = false
+            background = Colors.rounded(Colors.taskbar(this@LauncherActivity), dp(30).toFloat())
+            setTextColor(Colors.text(this@LauncherActivity))
+        }
+        panel.addView(include, LinearLayout.LayoutParams(WRAP, dp(48)).also { it.gravity = Gravity.CENTER; it.bottomMargin = dp(10) })
+        val divider = android.view.View(this).apply { setBackgroundColor(Colors.text(this@LauncherActivity) and 0x22000000) }
+        panel.addView(divider, LinearLayout.LayoutParams(MATCH, dp(1)))
+        val scroll = ScrollView(this).apply { isFillViewport = true; clipToPadding = false }
+        val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        scroll.addView(rows, ScrollView.LayoutParams(MATCH, WRAP))
+        panel.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        val cancel = TextView(this).apply {
+            text = UiText.text(this@LauncherActivity, "Cancel")
+            textSize = 15f
+            setTextColor(Colors.accent(this@LauncherActivity))
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(10), dp(8), dp(4))
+            setOnClickListener { dialog.dismiss() }
+        }
+        panel.addView(cancel, LinearLayout.LayoutParams(MATCH, dp(42)))
+
+        fun appName(info: AppWidgetProviderInfo): String = try {
+            pm.getApplicationLabel(pm.getApplicationInfo(info.provider.packageName, 0)).toString()
+        } catch (_: Exception) { info.provider.packageName }
+
+        fun refreshSelected() {
+            selectedTitle.text = try { selected.loadLabel(pm).toString() } catch (_: Exception) { selected.provider.className }
+            selectedApp.text = appName(selected)
+            sizeLabel.text = "${maxOf(1, selected.minWidth)} × ${maxOf(1, selected.minHeight)} dp"
+            val drawable = try { selected.loadPreviewImage(this, resources.displayMetrics.densityDpi) } catch (_: Exception) { null }
+            preview.setImageDrawable(drawable ?: try { pm.getApplicationIcon(selected.provider.packageName) } catch (_: Exception) { pm.defaultActivityIcon })
+        }
+
+        fun renderRows(query: String) {
+            rows.removeAllViews()
+            val filtered = all.filter { info ->
+                val label = try { info.loadLabel(pm).toString() } catch (_: Exception) { "" }
+                label.contains(query, true) || appName(info).contains(query, true)
+            }
+            for (info in filtered) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(8), dp(8), dp(8), dp(8))
+                    background = if (info == selected) Colors.rounded(Colors.surfaceHigh(this@LauncherActivity), dp(14).toFloat()) else ColorDrawable(Color.TRANSPARENT)
+                    isClickable = true
+                    isFocusable = true
+                }
+                val icon = ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    setImageDrawable(try { pm.getApplicationIcon(info.provider.packageName) } catch (_: Exception) { pm.defaultActivityIcon })
+                }
+                row.addView(icon, LinearLayout.LayoutParams(dp(42), dp(42)).also { it.marginEnd = dp(12) })
+                val labels = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                val title = TextView(this).apply {
+                    text = try { info.loadLabel(pm).toString() } catch (_: Exception) { info.provider.className }
+                    textSize = 16f
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setTextColor(Colors.text(this@LauncherActivity))
+                }
+                val subtitle = TextView(this).apply {
+                    text = appName(info)
+                    textSize = 12f
+                    alpha = 0.7f
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setTextColor(Colors.text(this@LauncherActivity))
+                }
+                labels.addView(title); labels.addView(subtitle)
+                row.addView(labels, LinearLayout.LayoutParams(0, WRAP, 1f))
+                row.setOnClickListener { selected = info; refreshSelected(); renderRows(search.text?.toString() ?: "") }
+                rows.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).also { it.bottomMargin = dp(3) })
+            }
+            if (filtered.isEmpty()) {
+                rows.addView(TextView(this).apply {
+                    text = UiText.text(this@LauncherActivity, "No widgets found")
+                    setTextColor(Colors.text(this@LauncherActivity)); setPadding(dp(12), dp(18), dp(12), dp(18))
+                })
+            }
+        }
+
+        include.setOnClickListener { dialog.dismiss(); startAdd(selected) }
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { renderRows(s?.toString() ?: "") }
+            override fun afterTextChanged(s: Editable?) {}
+        })
+        refreshSelected()
+        renderRows("")
+        UiText.applyDirection(panel, this)
+        dialog.setContentView(outer)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.show()
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout(android.view.WindowManager.LayoutParams.MATCH_PARENT, android.view.WindowManager.LayoutParams.MATCH_PARENT)
     }
 
     private fun startAdd(info: AppWidgetProviderInfo) {
@@ -248,11 +401,31 @@ class LauncherActivity : Activity() {
 
     // Must NOT be created as a field initializer: the Activity has no Context yet at construction time.
     private lateinit var swipe: android.view.GestureDetector
+    private var drawerWasAtTopOnTouchDown = false
     private fun makeSwipe() = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(e: MotionEvent): Boolean {
+            // Only allow a downward dismissal if the drawer was already at its top edge
+            // when this gesture began. Scrolling through the app list must never close it.
+            drawerWasAtTopOnTouchDown = drawer?.isContentAtTopForSwipeDismiss() == true
+            return true
+        }
+
         override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
-            if (e1 == null || Modes.tablet(this@LauncherActivity) || drawer != null) return false
+            if (e1 == null || Modes.tablet(this@LauncherActivity)) return false
             val dy = e1.y - e2.y
-            if (dy > dp(90) && vy < -900f && Math.abs(vy) > Math.abs(vx)) { root.post { toggleDrawer() }; return true }
+            val verticalSwipe = Math.abs(dy) > dp(90) && Math.abs(vy) > 900f && Math.abs(vy) > Math.abs(vx)
+            if (!verticalSwipe) return false
+
+            // Swipe up on the desktop opens the app drawer.
+            if (drawer == null && dy > 0 && vy < -900f) {
+                root.post { if (drawer == null) toggleDrawer() }
+                return true
+            }
+            // Swipe down closes it only when the content was already at the top before the gesture.
+            if (drawer != null && dy < 0 && vy > 900f && drawerWasAtTopOnTouchDown) {
+                root.post { if (drawer != null && drawer?.isContentAtTopForSwipeDismiss() == true) closeDrawer() }
+                return true
+            }
             return false
         }
     })

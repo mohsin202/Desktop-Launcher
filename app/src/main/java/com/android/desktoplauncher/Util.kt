@@ -104,27 +104,33 @@ object Colors {
 object Blur {
     fun on(c: Context) = Build.VERSION.SDK_INT >= 31 && Prefs.bool(c, Prefs.K_BLUR, false)
 
+    /** Apply blur only inside this window's bounds. BLUR_BEHIND blurs the whole area behind
+     * a window on several Android builds, so use the bounded background-blur radius instead. */
     fun apply(lp: android.view.WindowManager.LayoutParams, c: Context, radiusDp: Int = 28) {
         if (Build.VERSION.SDK_INT < 31) return
+        lp.flags = lp.flags and android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+        lp.blurBehindRadius = 0
         if (on(c)) {
-            lp.flags = lp.flags or android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-            lp.blurBehindRadius = c.dp(radiusDp)
+            lp.setBackgroundBlurRadius(c.dp(radiusDp))
         } else {
-            lp.flags = lp.flags and android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
-            lp.blurBehindRadius = 0
+            lp.setBackgroundBlurRadius(0)
         }
     }
 
-    /** Blur behind an already shown popup window. */
+    /** Blur behind an already shown popup. Do not set BLUR_BEHIND: it can blur the full screen. */
     fun popup(c: Context, pw: android.widget.PopupWindow) {
-        if (!on(c)) return
+        if (Build.VERSION.SDK_INT < 31 || !on(c)) return
         pw.contentView.post {
             try {
                 val root = pw.contentView.rootView
                 val lp = root.layoutParams as? android.view.WindowManager.LayoutParams ?: return@post
-                apply(lp, c, 24)
+                lp.flags = lp.flags and android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+                lp.blurBehindRadius = 0
+                lp.setBackgroundBlurRadius(c.dp(24))
                 c.getSystemService(android.view.WindowManager::class.java).updateViewLayout(root, lp)
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                // Keep the translucent popup usable even if the ROM disallows background blur.
+            }
         }
     }
 }

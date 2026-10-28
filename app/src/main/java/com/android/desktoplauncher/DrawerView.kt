@@ -41,7 +41,8 @@ class Result(
     val sub: String = "",
     val icon: Drawable? = null,
     val file: File? = null,
-    val action: () -> Unit = {}
+    val action: () -> Unit = {},
+    val keepOpen: Boolean = false
 )
 
 /**
@@ -57,6 +58,8 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     private val main = Handler(Looper.getMainLooper())
     private val bg = Executors.newSingleThreadExecutor()
     private var gen = 0
+    private var activeQuery = ""
+    @Volatile private var showAllFiles = false
     private val allApps: List<AppInfo> = AppRepo.apps(c)
     private var apps: List<AppInfo> = allApps
     private var results: List<Result> = emptyList()
@@ -175,7 +178,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         list.adapter = listAdapter
         list.divider = null
         list.visibility = GONE
-        list.setOnItemClickListener { _, _, p, _ -> results[p].let { if (!it.header) { it.action(); onClose() } } }
+        list.setOnItemClickListener { _, _, p, _ -> results[p].let { if (!it.header) { it.action(); if (!it.keepOpen) onClose() } } }
         list.setOnItemLongClickListener { _, v, p, _ ->
             val r = results.getOrNull(p) ?: return@setOnItemLongClickListener false
             if (r.header) return@setOnItemLongClickListener true
@@ -205,6 +208,15 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             true
         }
         loadShortcuts()
+    }
+
+    /** True only when the currently displayed drawer content is already at its top edge. */
+    fun isContentAtTopForSwipeDismiss(): Boolean {
+        val target = if (list.visibility == VISIBLE) list else grid
+        if (target.visibility != VISIBLE) return true
+        if (target.firstVisiblePosition > 0) return false
+        val first = target.getChildAt(0) ?: return true
+        return first.top >= target.paddingTop
     }
 
     /** Called after the view is attached. */
@@ -274,6 +286,10 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
 
     private fun runSearch(q: String) {
         val query = q.trim()
+        if (query != activeQuery) {
+            activeQuery = query
+            showAllFiles = false
+        }
         val my = ++gen
         if (query.isEmpty()) {
             apps = allApps
@@ -339,7 +355,8 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         val fs = searchFiles(q)
         if (fs.isNotEmpty()) {
             out += Result(true, "Files")
-            for (f in fs.take(5)) out += Result(false, f.name, f.parent ?: "", Icons.file(f), f) {
+            val visibleFiles = if (showAllFiles) fs else fs.take(5)
+            for (f in visibleFiles) out += Result(false, f.name, f.parent ?: "", Icons.file(f), f) {
                 if (f.extension == "desktoplink") {
                     try {
                         val target = f.readLines().getOrNull(1)?.let { File(it) }
@@ -347,7 +364,14 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                     } catch (_: Exception) { c.toast("Invalid shortcut") }
                 } else Files.open(c, f)
             }
-            if (fs.size > 5) out += Result(false, "See all files", "Open Desktop folder") { Files.open(c, Files.root(c)) }
+            if (fs.size > 5) {
+                val toggleLabel = if (showAllFiles) "Hide all files" else "See all files"
+                val toggleSub = if (showAllFiles) "Show only the first 5 results" else "Show all matching results"
+                out += Result(false, toggleLabel, toggleSub, action = {
+                    showAllFiles = !showAllFiles
+                    runSearch(search.text?.toString() ?: "")
+                }, keepOpen = true)
+            }
         }
 
         out += Result(true, "In apps")
@@ -371,7 +395,6 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             args.putString(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?")
             args.putStringArray(android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf("%$q%"))
             args.putString(android.content.ContentResolver.QUERY_ARG_SQL_SORT_ORDER, "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC")
-            args.putInt(android.content.ContentResolver.QUERY_ARG_LIMIT, 12)
             c.contentResolver.query(
                 MediaStore.Files.getContentUri("external"),
                 arrayOf(MediaStore.Files.FileColumns.DATA), args, null
@@ -388,7 +411,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             Files.root(c).listFiles()?.filter { it.name.lowercase().contains(q.lowercase()) && res.none { r -> r == it } }
                 ?.take(6)?.let { res.addAll(0, it) }
         } catch (_: Exception) {}
-        return res.take(14)
+        return res.distinctBy { it.absolutePath }
     }
 
     private fun inAppSearches(q: String): List<Pair<String, () -> Intent>> {
