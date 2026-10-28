@@ -32,11 +32,44 @@ class DesktopView(private val act: LauncherActivity) : FrameLayout(act) {
     private var lastY = 0
 
     init {
+        UiText.applyDirection(this, act)
         isClickable = true
         isLongClickable = true
         setOnClickListener { clearSelection(); act.closeDrawer() }
         setOnLongClickListener { desktopMenu(lastX, lastY); true }
         setSecondaryClick { x, y -> desktopMenu(x, y) }
+        setOnDragListener { _, event ->
+            when (event.action) {
+                android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription != null
+                android.view.DragEvent.ACTION_DROP -> {
+                    val clipData = event.clipData
+                    var copied = 0
+                    val permissions = try { act.requestDragAndDropPermissions(event) } catch (_: Exception) { null }
+                    if (clipData != null) Thread {
+                        try {
+                            for (i in 0 until clipData.itemCount) {
+                                val item = clipData.getItemAt(i)
+                                val uri = item.uri ?: item.intent?.data ?: continue
+                                try {
+                                    var name = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "Dropped file"
+                                    try {
+                                        context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                                            if (it.moveToFirst()) name = it.getString(0)?.takeIf { n -> n.isNotBlank() } ?: name
+                                        }
+                                    } catch (_: Exception) {}
+                                    val out = Files.unique(Files.root(context), name)
+                                    context.contentResolver.openInputStream(uri)?.use { input -> out.outputStream().use { input.copyTo(it) } }
+                                    if (out.exists()) copied++
+                                } catch (_: Exception) {}
+                            }
+                        } finally { try { permissions?.release() } catch (_: Exception) {} }
+                        post { reload(); context.toast(if (copied > 0) "Dropped ${copied} item(s)" else "Cannot drop these items here") }
+                    }.start() else try { permissions?.release() } catch (_: Exception) {}
+                    true
+                }
+                else -> true
+            }
+        }
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
@@ -188,7 +221,7 @@ class DesktopView(private val act: LauncherActivity) : FrameLayout(act) {
         // 1) icons the user placed freely
         for ((e, _) in items) {
             val p = stored[e.key] ?: continue
-            if (p[0] in 0 until gCols && p[1] in 0 until gRows && occ.add(p[0] * 10000 + p[1])) cells[e.key] = p
+            if (p[0] in 0 until gCols && p[1] in 0 until gRows && !blockedByWidget(p[0], p[1]) && occ.add(p[0] * 10000 + p[1])) cells[e.key] = p
         }
         // 2) everything else flows automatically: desktop = columns (top to bottom), phone = rows (left to right)
         var i = 0
@@ -199,7 +232,7 @@ class DesktopView(private val act: LauncherActivity) : FrameLayout(act) {
                 val k = i++
                 val col = if (tablet) k / gRows else k % gCols
                 val row = if (tablet) k % gRows else k / gCols
-                if (occ.add(col * 10000 + row)) cell = intArrayOf(col, row)
+                if (!blockedByWidget(col, row) && occ.add(col * 10000 + row)) cell = intArrayOf(col, row)
             }
             cells[e.key] = cell ?: intArrayOf(0, 0)
         }
@@ -338,8 +371,26 @@ class DesktopView(private val act: LauncherActivity) : FrameLayout(act) {
     private fun open(e: Entry) {
         when (e) {
             is Entry.AppE -> Launch.app(context, e.info.comp)
-            is Entry.FileE -> Files.open(context, e.file)
+            is Entry.FileE -> openFile(e.file)
         }
+    }
+
+    fun openFile(f: File) {
+        if (f.extension == "desktoplink") {
+            try {
+                val targetPath = f.readLines().getOrNull(1)
+                val target = targetPath?.let { File(it) }
+                if (target != null && target.exists()) Files.open(context, target) else context.toast("Shortcut target not found")
+            } catch (_: Exception) { context.toast("Invalid shortcut") }
+        } else Files.open(context, f)
+    }
+
+    private fun blockedByWidget(col: Int, row: Int): Boolean {
+        val left = paddingLeft + d(8) + col * gCw
+        val top = paddingTop + row * gCh
+        val right = left + gCw
+        val bottom = top + gCh
+        return widgets.any { b -> left < b.px + b.w && right > b.px && top < b.py + b.h && bottom > b.py }
     }
 
     // ---------------------------------------------------------------- menus
@@ -386,6 +437,7 @@ class DesktopView(private val act: LauncherActivity) : FrameLayout(act) {
             ))
             is Entry.FileE -> m.show(x, y, listOf(
                 MenuItem("Open") { open(e) },
+                MenuItem("Rename") { renameItem(e.file) },
                 MenuItem("Cut", bold = true) { Clip.set(c, listOf(e.file), true); reload() },
                 MenuItem("Copy", bold = true) { Clip.set(c, listOf(e.file), false); c.toast("Copied") },
                 MenuItem("Share", enabled = e.file.isFile) { Launch.shareFile(c, e.file) },
@@ -396,6 +448,22 @@ class DesktopView(private val act: LauncherActivity) : FrameLayout(act) {
                 MenuItem("Delete") { confirmDelete(e.file) }
             ))
         }
+    }
+
+    private fun renameItem(f: File) {
+        val et = EditText(act)
+        et.setText(f.name)
+        et.selectAll()
+        AlertDialog.Builder(act).setTitle("Rename").setView(et)
+            .setPositiveButton("Rename") { _, _ ->
+                val name = et.text.toString().trim().replace('/', '_')
+                if (name.isNotBlank() && name != f.name) {
+                    val target = File(f.parentFile, name)
+                    if (target.exists()) context.toast("A file with that name already exists")
+                    else if (!f.renameTo(target)) context.toast("Rename failed")
+                    reload()
+                }
+            }.setNegativeButton("Cancel", null).show()
     }
 
     private fun confirmDelete(f: File) {
@@ -433,11 +501,7 @@ class DesktopView(private val act: LauncherActivity) : FrameLayout(act) {
 
     fun widgetMenu(box: WidgetBox, x: Int, y: Int) {
         val m = PopupMenuX(context, this)
-        m.show(x, y, listOf(
-            MenuItem("Larger") { box.scale(1.2f) },
-            MenuItem("Smaller") { box.scale(0.83f) },
-            MenuItem("Remove") { removeWidget(box) }
-        ))
+        m.show(x, y, listOf(MenuItem("Remove") { removeWidget(box) }))
     }
 }
 
@@ -447,20 +511,43 @@ class WidgetBox(
 ) : FrameLayout(ctx) {
     private var moving = false
     private var moved = false
+    private var resizeMode = false
+    private var justActivatedResize = false
+    private var resizing = false
+    private var resizeCorner = 3
     private var startRawX = 0f
     private var startRawY = 0f
     private var startPx = 0
     private var startPy = 0
+    private var startW = 0
+    private var startH = 0
+    private val edgePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = Colors.accent(ctx); style = android.graphics.Paint.Style.STROKE; strokeWidth = ctx.dp(2).toFloat()
+    }
+    private val handlePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { color = Colors.accent(ctx); style = android.graphics.Paint.Style.FILL }
 
     private val gd = GestureDetector(ctx, object : GestureDetector.SimpleOnGestureListener() {
         override fun onLongPress(e: MotionEvent) {
             moving = true; moved = false
-            startPx = px; startPy = py
+            startPx = px; startPy = py; startW = w; startH = h
+            if (!resizeMode) { resizeMode = true; justActivatedResize = true; invalidate() }
+            else { moving = false; owner.widgetMenu(this@WidgetBox, e.rawX.toInt(), e.rawY.toInt()) }
             performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
         }
     })
 
-    init { addView(hv, LayoutParams(MATCH, MATCH)) }
+    init { addView(hv, LayoutParams(MATCH, MATCH)); setWillNotDraw(false) }
+
+    override fun dispatchDraw(canvas: android.graphics.Canvas) {
+        super.dispatchDraw(canvas)
+        if (resizeMode) {
+            val inset = context.dp(2).toFloat()
+            canvas.drawRoundRect(inset, inset, width - inset, height - inset, context.dp(8).toFloat(), context.dp(8).toFloat(), edgePaint)
+            val r = context.dp(5).toFloat()
+            val pts = arrayOf(floatArrayOf(inset, inset), floatArrayOf(width - inset, inset), floatArrayOf(inset, height - inset), floatArrayOf(width - inset, height - inset))
+            for (pt in pts) canvas.drawCircle(pt[0], pt[1], r, handlePaint)
+        }
+    }
 
     fun pushSize() {
         val dm = context.resources.displayMetrics
@@ -478,8 +565,24 @@ class WidgetBox(
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             startRawX = ev.rawX; startRawY = ev.rawY
+            startPx = px; startPy = py; startW = w; startH = h
             if ((ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0) {
                 owner.widgetMenu(this, ev.rawX.toInt(), ev.rawY.toInt()); return true
+            }
+            val handle = context.dp(24)
+            val left = ev.x <= handle
+            val right = ev.x >= width - handle
+            val top = ev.y <= handle
+            val bottom = ev.y >= height - handle
+            resizing = resizeMode && (left || right) && (top || bottom)
+            if (resizing) {
+                resizeCorner = when {
+                    left && top -> 0
+                    right && top -> 1
+                    left && bottom -> 2
+                    else -> 3
+                }
+                moving = true; moved = false; return true
             }
         }
         gd.onTouchEvent(ev)
@@ -492,14 +595,31 @@ class WidgetBox(
             MotionEvent.ACTION_MOVE -> {
                 val dx = ev.rawX - startRawX
                 val dy = ev.rawY - startRawY
-                if (Math.abs(dx) > context.dp(8) || Math.abs(dy) > context.dp(8)) moved = true
-                px = (startPx + dx).toInt().coerceIn(0, maxOf(0, owner.width - w))
-                py = (startPy + dy).toInt().coerceIn(0, maxOf(0, owner.height - h))
-                owner.requestLayout()
+                if (Math.abs(dx) > context.dp(4) || Math.abs(dy) > context.dp(4)) moved = true
+                if (resizing) {
+                    val minW = context.dp(100); val minH = context.dp(70)
+                    val rawW = when (resizeCorner) { 0, 2 -> startW - dx; else -> startW + dx }
+                    val rawH = when (resizeCorner) { 0, 1 -> startH - dy; else -> startH + dy }
+                    w = rawW.toInt().coerceAtLeast(minW)
+                    h = rawH.toInt().coerceAtLeast(minH)
+                    if (resizeCorner == 0 || resizeCorner == 2) px = (startPx + startW - w).toInt().coerceAtLeast(0)
+                    if (resizeCorner == 0 || resizeCorner == 1) py = (startPy + startH - h).toInt().coerceAtLeast(0)
+                    w = minOf(w, maxOf(minW, owner.width - px))
+                    h = minOf(h, maxOf(minH, owner.height - py))
+                    pushSize(); owner.requestLayout(); invalidate()
+                } else {
+                    px = (startPx + dx).toInt().coerceIn(0, maxOf(0, owner.width - w))
+                    py = (startPy + dy).toInt().coerceIn(0, maxOf(0, owner.height - h))
+                    owner.requestLayout()
+                }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 moving = false
-                if (moved) owner.saveWidgets() else owner.widgetMenu(this, ev.rawX.toInt(), ev.rawY.toInt())
+                if (moved) owner.saveWidgets()
+                else if (justActivatedResize) { justActivatedResize = false }
+                else if (resizeMode) owner.widgetMenu(this, ev.rawX.toInt(), ev.rawY.toInt())
+                justActivatedResize = false
+                resizing = false
             }
         }
         return true

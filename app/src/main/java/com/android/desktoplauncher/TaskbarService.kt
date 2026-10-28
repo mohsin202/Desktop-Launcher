@@ -128,8 +128,11 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
             }
         } catch (_: Exception) {}
         var changed = false
-        for (p in vis) if (running.add(p)) changed = true
-        while (running.size > 10) { running.remove(running.first()); changed = true }
+        if (running.toSet() != vis.toSet()) {
+            running.clear()
+            running.addAll(vis.take(10))
+            changed = true
+        }
         if (fg != focused) { focused = fg; changed = true }
         val ime = imeWin || editing
         if (ime != imeShown) { imeShown = ime; changed = true }
@@ -201,7 +204,8 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
         lp.setFitInsetsTypes(0)
         lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
         lp.title = "DesktopDrawer"
-        Blur.apply(lp, uctx, 30)
+        // Do not use BLUR_BEHIND on this full-screen touch layer: Android blurs the entire
+        // app area and some ROMs also stop dispatching touches. The panel itself is translucent.
         try { wm.addView(d, lp); drawer = d; d.post { d.onShown() } } catch (_: Exception) {}
     }
 
@@ -219,12 +223,17 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
     private var menu: PopupMenuX? = null
 
     init {
+        UiText.applyDirection(this, ctx)
+        UiText.applyDirection(center, ctx)
+        UiText.applyDirection(right, ctx)
         elevation = if (pill) ctx.dp(6).toFloat() else 0f
         center.orientation = LinearLayout.HORIZONTAL
         center.gravity = Gravity.CENTER_VERTICAL
         right.orientation = LinearLayout.HORIZONTAL
         right.gravity = Gravity.CENTER_VERTICAL
-        addView(center, LayoutParams(WRAP, MATCH, Gravity.CENTER))
+        addView(center, LayoutParams(MATCH, MATCH, Gravity.START or Gravity.CENTER_VERTICAL).also {
+            it.leftMargin = ctx.dp(4)
+        })
         addView(right, LayoutParams(WRAP, MATCH, Gravity.END).also { it.rightMargin = ctx.dp(8) })
         refresh()
     }
@@ -233,6 +242,9 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
         RippleDrawable(ColorStateList.valueOf(0x33000000), null, Colors.rounded(0xFFFFFFFF.toInt(), ctx.dp(10).toFloat()))
 
     fun refresh() {
+        UiText.applyDirection(this, ctx)
+        UiText.applyDirection(center, ctx)
+        UiText.applyDirection(right, ctx)
         background = if (pill) Colors.rounded(Colors.taskbar(ctx), ctx.dp(28).toFloat()) else android.graphics.drawable.ColorDrawable(Colors.taskbar(ctx))
         center.removeAllViews()
         right.removeAllViews()
@@ -247,16 +259,34 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
 
         val pinned = Prefs.list(ctx, Prefs.K_PINNED).mapNotNull { ComponentName.unflattenFromString(it) }
         val shownPk = HashSet<String>()
+        val appsRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         for (comp in pinned) {
             shownPk += comp.packageName
-            center.addView(appItem(comp, svc.running.contains(comp.packageName), svc.focused == comp.packageName, true, cell),
+            appsRow.addView(appItem(comp, svc.running.contains(comp.packageName), svc.focused == comp.packageName, true, cell),
                 LinearLayout.LayoutParams(cell, MATCH))
         }
-        for (pkg in svc.running) {
-            if (pkg in shownPk) continue
-            val comp = AppRepo.byPkg(ctx, pkg)?.comp ?: continue
-            center.addView(appItem(comp, true, svc.focused == pkg, false, cell), LinearLayout.LayoutParams(cell, MATCH))
+        val unpinned = svc.running.filter { it !in shownPk }.mapNotNull { pkg -> AppRepo.byPkg(ctx, pkg)?.let { pkg to it.comp } }
+        if (unpinned.isNotEmpty() && pinned.isNotEmpty()) {
+            val divider = View(ctx)
+            divider.setBackgroundColor(Colors.text(ctx) and 0x55FFFFFF)
+            appsRow.addView(divider, LinearLayout.LayoutParams(ctx.dp(1), (h * 0.58f).toInt()).also {
+                it.leftMargin = ctx.dp(5); it.rightMargin = ctx.dp(5)
+            })
         }
+        for ((pkg, comp) in unpinned) {
+            appsRow.addView(appItem(comp, true, svc.focused == pkg, false, cell), LinearLayout.LayoutParams(cell, MATCH))
+        }
+        val scroll = android.widget.HorizontalScrollView(ctx).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            clipToPadding = false
+            addView(appsRow, android.widget.HorizontalScrollView.LayoutParams(WRAP, MATCH))
+        }
+        center.addView(scroll, LinearLayout.LayoutParams(0, MATCH, 1f))
+        val navCount = if (showNav && Prefs.bool(ctx, Prefs.K_NAV, true)) 3 else 0
+        val imeCount = if (showNav && svc.imeShown && Prefs.bool(ctx, Prefs.K_IME, true)) 1 else 0
+        val navReserve = if (showNav) cell * (navCount + imeCount) + ctx.dp(92) else ctx.dp(4)
+        (center.layoutParams as? LayoutParams)?.let { it.rightMargin = navReserve; center.layoutParams = it }
 
         if (showNav && svc.imeShown && Prefs.bool(ctx, Prefs.K_IME, true)) {
             right.addView(ImeButton(ctx).also { b ->

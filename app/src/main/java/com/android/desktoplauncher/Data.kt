@@ -132,7 +132,8 @@ object Clip {
         }
         val clip = c.getSystemService(ClipboardManager::class.java).primaryClip ?: return 0
         for (i in 0 until clip.itemCount) {
-            val uri = clip.getItemAt(i).uri ?: continue
+            val item = clip.getItemAt(i)
+            val uri = item.uri ?: item.intent?.data ?: continue
             try {
                 if (uri.scheme == "file") {
                     val src = File(uri.path ?: continue)

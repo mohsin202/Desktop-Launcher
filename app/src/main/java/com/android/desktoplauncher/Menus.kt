@@ -35,6 +35,7 @@ class PopupMenuX(private val ctx: Context, private val anchor: View) {
     private fun level(x: Int, y: Int, items: List<MenuItem>, lvl: Int, above: Boolean, flipX: Int?) {
         closeFrom(lvl)
         val col = LinearLayout(ctx)
+        UiText.applyDirection(col, ctx)
         col.orientation = LinearLayout.VERTICAL
         col.background = Colors.rounded(Colors.surface(ctx), ctx.dp(12).toFloat())
         col.setPadding(ctx.dp(4), ctx.dp(6), ctx.dp(4), ctx.dp(6))
@@ -42,11 +43,12 @@ class PopupMenuX(private val ctx: Context, private val anchor: View) {
 
         for (item in items) {
             val row = LinearLayout(ctx)
+            UiText.applyDirection(row, ctx)
             row.orientation = LinearLayout.HORIZONTAL
             row.gravity = Gravity.CENTER_VERTICAL
             row.setPadding(ctx.dp(14), ctx.dp(10), ctx.dp(14), ctx.dp(10))
             val tv = TextView(ctx)
-            tv.text = (if (item.checked) "✓  " else "") + item.label
+            tv.text = (if (item.checked) "✓  " else "") + UiText.text(ctx, item.label)
             tv.textSize = 15f
             tv.setTextColor(Colors.text(ctx))
             if (item.bold && item.enabled) tv.setTypeface(tv.typeface, Typeface.BOLD)

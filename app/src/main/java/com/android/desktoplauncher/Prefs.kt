@@ -31,9 +31,17 @@ object Prefs {
     const val K_WINKEY = "winkey"
     const val K_SEEDED = "seeded"
     const val K_MODE = "mode"
+    const val K_DRAWER_IME = "drawerIme"
+    const val K_LANGUAGE = "uiLanguage" // 0 English, 1 Urdu
+    const val K_DIRECTION = "uiDirection" // 0 system, 1 LTR, 2 RTL
 
     private fun sp(c: Context): SharedPreferences =
         c.applicationContext.getSharedPreferences("desktop", Context.MODE_PRIVATE)
+
+    fun language(c: Context) = sp(c).getInt(K_LANGUAGE, 0).coerceIn(0, 1)
+    fun setLanguage(c: Context, v: Int) { sp(c).edit().putInt(K_LANGUAGE, v.coerceIn(0, 1)).apply(); Bus.fire() }
+    fun direction(c: Context) = sp(c).getInt(K_DIRECTION, 0).coerceIn(0, 2)
+    fun setDirection(c: Context, v: Int) { sp(c).edit().putInt(K_DIRECTION, v.coerceIn(0, 2)).apply(); Bus.fire() }
 
     fun iconMode(c: Context) = sp(c).getInt("iconMode", 1).coerceIn(0, 2)
     fun setIconMode(c: Context, v: Int) { sp(c).edit().putInt("iconMode", v).apply(); Bus.fire() }

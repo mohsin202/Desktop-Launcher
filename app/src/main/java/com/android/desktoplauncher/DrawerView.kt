@@ -40,6 +40,7 @@ class Result(
     val title: String,
     val sub: String = "",
     val icon: Drawable? = null,
+    val file: File? = null,
     val action: () -> Unit = {}
 )
 
@@ -56,7 +57,8 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     private val main = Handler(Looper.getMainLooper())
     private val bg = Executors.newSingleThreadExecutor()
     private var gen = 0
-    private var apps: List<AppInfo> = AppRepo.apps(c)
+    private val allApps: List<AppInfo> = AppRepo.apps(c)
+    private var apps: List<AppInfo> = allApps
     private var results: List<Result> = emptyList()
     private var shortcutCache: List<ShortcutInfo> = emptyList()
     private val themed = Prefs.bool(c, Prefs.K_THEMED, false)
@@ -90,7 +92,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             if (r.header) {
                 row.setPadding(c.dp(12), c.dp(12), c.dp(12), c.dp(4))
                 val t = TextView(c)
-                t.text = r.title
+                t.text = UiText.text(c, r.title)
                 t.textSize = 12f
                 t.setTextColor(Colors.accent(c))
                 row.addView(t)
@@ -104,7 +106,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                 val col = LinearLayout(c)
                 col.orientation = LinearLayout.VERTICAL
                 val t = TextView(c)
-                t.text = r.title
+                t.text = UiText.text(c, r.title)
                 t.textSize = 15f
                 t.setTextColor(Colors.text(c))
                 t.maxLines = 1
@@ -112,7 +114,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                 col.addView(t)
                 if (r.sub.isNotEmpty()) {
                     val s = TextView(c)
-                    s.text = r.sub
+                    s.text = UiText.text(c, r.sub)
                     s.textSize = 12f
                     s.alpha = 0.6f
                     s.setTextColor(Colors.text(c))
@@ -127,6 +129,9 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     }
 
     init {
+        UiText.applyDirection(this, c)
+        UiText.applyDirection(panel, c)
+        UiText.applyDirection(search, c)
         isClickable = true
         setOnClickListener { onClose() }
         val dm = c.resources.displayMetrics
@@ -138,11 +143,11 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         panel.setPadding(c.dp(14), c.dp(14), c.dp(14), c.dp(10))
         panel.isClickable = true
         val lp = LayoutParams(pw, ph, if (wide) Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL else Gravity.BOTTOM or Gravity.START)
-        if (!wide) lp.leftMargin = c.dp(8)
+        if (!wide) lp.marginStart = c.dp(8)
         lp.bottomMargin = bottomMargin
         addView(panel, lp)
 
-        search.hint = "Search"
+        search.hint = UiText.text(c, "Search")
         search.setSingleLine()
         search.inputType = InputType.TYPE_CLASS_TEXT
         search.imeOptions = EditorInfo.IME_ACTION_SEARCH
@@ -171,6 +176,23 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         list.divider = null
         list.visibility = GONE
         list.setOnItemClickListener { _, _, p, _ -> results[p].let { if (!it.header) { it.action(); onClose() } } }
+        list.setOnItemLongClickListener { _, v, p, _ ->
+            val r = results.getOrNull(p) ?: return@setOnItemLongClickListener false
+            if (r.header) return@setOnItemLongClickListener true
+            val loc = IntArray(2); v.getLocationOnScreen(loc)
+            val items = ArrayList<MenuItem>()
+            items += MenuItem("Open") { r.action(); onClose() }
+            r.file?.let { f -> items += MenuItem("Create shortcut on Desktop") {
+                val dest = Files.unique(Files.root(c), f.name + ".desktoplink")
+                try {
+                    val content = "DESKTOP_SHORTCUT\n${f.absolutePath}"
+                    dest.writeText(content)
+                    c.toast("Shortcut created on Desktop")
+                } catch (_: Exception) { c.toast("Could not create shortcut") }
+            } }
+            PopupMenuX(c, this).show(loc[0], loc[1] + v.height, items)
+            true
+        }
         panel.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f).also { it.topMargin = c.dp(6) })
 
         search.addTextChangedListener(object : TextWatcher {
@@ -188,15 +210,21 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     /** Called after the view is attached. */
     fun onShown() {
         search.requestFocus()
-        if (c.resources.configuration.keyboard == android.content.res.Configuration.KEYBOARD_NOKEYS) {
+        if (Prefs.bool(c, Prefs.K_DRAWER_IME, false) && c.resources.configuration.keyboard == android.content.res.Configuration.KEYBOARD_NOKEYS) {
             val imm = c.getSystemService(InputMethodManager::class.java)
-            search.postDelayed({ imm?.showSoftInput(search, 0) }, 150)
+            search.postDelayed({ imm?.showSoftInput(search, InputMethodManager.SHOW_IMPLICIT) }, 180)
         }
     }
 
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
         if (e.action == KeyEvent.ACTION_UP && (e.keyCode == KeyEvent.KEYCODE_BACK || e.keyCode == KeyEvent.KEYCODE_ESCAPE)) {
-            onClose(); return true
+            val imeVisible = try { rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true } catch (_: Exception) { false }
+            if (imeVisible) {
+                val imm = c.getSystemService(InputMethodManager::class.java)
+                imm?.hideSoftInputFromWindow(search.windowToken, 0)
+                search.clearFocus()
+            } else onClose()
+            return true
         }
         return super.dispatchKeyEvent(e)
     }
@@ -233,7 +261,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                 val flags = LauncherApps.ShortcutQuery.FLAG_MATCH_DYNAMIC or
                     LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST or
                     LauncherApps.ShortcutQuery.FLAG_MATCH_PINNED
-                for (pkg in apps.map { it.pkg }.distinct()) {
+                for (pkg in allApps.map { it.pkg }.distinct()) {
                     try {
                         val q = LauncherApps.ShortcutQuery().setPackage(pkg).setQueryFlags(flags)
                         la.getShortcuts(q, Process.myUserHandle())?.let { out.addAll(it) }
@@ -248,11 +276,15 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         val query = q.trim()
         val my = ++gen
         if (query.isEmpty()) {
+            apps = allApps
+            gridAdapter.notifyDataSetChanged()
             list.visibility = GONE
             grid.visibility = VISIBLE
             return
         }
-        grid.visibility = GONE
+        apps = allApps.filter { it.label.contains(query, ignoreCase = true) }
+        gridAdapter.notifyDataSetChanged()
+        grid.visibility = if (apps.isEmpty()) GONE else VISIBLE
         list.visibility = VISIBLE
         bg.execute {
             val r = buildResults(query)
@@ -263,12 +295,6 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     private fun buildResults(q: String): List<Result> {
         val ql = q.lowercase()
         val out = ArrayList<Result>()
-
-        val appHits = apps.filter { it.label.lowercase().contains(ql) }.take(8)
-        if (appHits.isNotEmpty()) {
-            out += Result(true, "Apps")
-            for (a in appHits) out += Result(false, a.label, "", Icons.app(c, a.comp, false)) { Launch.app(c, a.comp) }
-        }
 
         val setHits = SETTINGS.filter { it.first.lowercase().contains(ql) }
         if (setHits.isNotEmpty()) {
@@ -313,7 +339,15 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         val fs = searchFiles(q)
         if (fs.isNotEmpty()) {
             out += Result(true, "Files")
-            for (f in fs) out += Result(false, f.name, f.parent ?: "", Icons.file(f)) { Files.open(c, f) }
+            for (f in fs.take(5)) out += Result(false, f.name, f.parent ?: "", Icons.file(f), f) {
+                if (f.extension == "desktoplink") {
+                    try {
+                        val target = f.readLines().getOrNull(1)?.let { File(it) }
+                        if (target != null && target.exists()) Files.open(c, target) else c.toast("Shortcut target not found")
+                    } catch (_: Exception) { c.toast("Invalid shortcut") }
+                } else Files.open(c, f)
+            }
+            if (fs.size > 5) out += Result(false, "See all files", "Open Desktop folder") { Files.open(c, Files.root(c)) }
         }
 
         out += Result(true, "In apps")

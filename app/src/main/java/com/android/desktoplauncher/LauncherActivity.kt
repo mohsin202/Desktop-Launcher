@@ -64,6 +64,7 @@ class LauncherActivity : Activity() {
         root.addView(banner, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.END).also {
             it.topMargin = dp(48); it.rightMargin = dp(12)
         })
+        UiText.applyDirection(root, this)
         setContentView(root)
         root.setOnApplyWindowInsetsListener { _, ins ->
             val bars = ins.getInsets(WindowInsets.Type.systemBars())
@@ -94,6 +95,7 @@ class LauncherActivity : Activity() {
 
     /** Phone (<600dp): normal dock on the home screen. Tablet (>=600dp): dock merges into the taskbar overlay. */
     private fun applyMode() {
+        if (::root.isInitialized) UiText.applyDirection(root, this)
         val phone = !Modes.tablet(this)
         if (phone && barOn()) {
             dockH = dp(Prefs.tbDp(this)) + dp(4)
@@ -190,6 +192,8 @@ class LauncherActivity : Activity() {
         }
     }
 
+    fun desktopOpenFile(file: java.io.File) { desktop.openFile(file) }
+
     fun closeDrawer() {
         drawer?.let { root.removeView(it) }
         drawer = null
@@ -248,7 +252,7 @@ class LauncherActivity : Activity() {
         override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
             if (e1 == null || Modes.tablet(this@LauncherActivity) || drawer != null) return false
             val dy = e1.y - e2.y
-            if (dy > dp(90) && vy < -900f && Math.abs(vy) > Math.abs(vx)) { toggleDrawer(); return true }
+            if (dy > dp(90) && vy < -900f && Math.abs(vy) > Math.abs(vx)) { root.post { toggleDrawer() }; return true }
             return false
         }
     })
