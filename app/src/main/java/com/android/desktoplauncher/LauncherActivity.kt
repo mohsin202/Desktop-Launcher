@@ -45,6 +45,7 @@ class LauncherActivity : Activity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        swipe = makeSwipe()
         window.setDecorFitsSystemWindows(false)
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
@@ -241,7 +242,9 @@ class LauncherActivity : Activity() {
         }
     }
 
-    private val swipe = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+    // Must NOT be created as a field initializer: the Activity has no Context yet at construction time.
+    private lateinit var swipe: android.view.GestureDetector
+    private fun makeSwipe() = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
         override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
             if (e1 == null || Modes.tablet(this@LauncherActivity) || drawer != null) return false
             val dy = e1.y - e2.y
@@ -251,7 +254,7 @@ class LauncherActivity : Activity() {
     })
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        swipe.onTouchEvent(ev)
+        if (::swipe.isInitialized) swipe.onTouchEvent(ev)
         return super.dispatchTouchEvent(ev)
     }
 
