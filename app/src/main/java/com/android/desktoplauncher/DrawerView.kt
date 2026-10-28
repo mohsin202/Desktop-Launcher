@@ -315,9 +315,9 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         val setHits = SETTINGS.filter { it.first.lowercase().contains(ql) }
         if (setHits.isNotEmpty()) {
             out += Result(true, "Settings")
-            for ((name, action) in setHits) out += Result(false, name, "System settings") {
+            for ((name, action) in setHits) out += Result(false, name, "System settings", action = {
                 if (action == "wallpaper") Launch.wallpapers(c) else Launch.start(c, Intent(action))
-            }
+            })
         }
 
         val sc = shortcutCache.filter {
@@ -327,9 +327,9 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         if (sc.isNotEmpty()) {
             out += Result(true, "App shortcuts")
             val la = c.getSystemService(LauncherApps::class.java)
-            for (s in sc) out += Result(false, s.shortLabel?.toString() ?: s.id, AppRepo.byPkg(c, s.`package`)?.label ?: s.`package`) {
+            for (s in sc) out += Result(false, s.shortLabel?.toString() ?: s.id, AppRepo.byPkg(c, s.`package`)?.label ?: s.`package`, action = {
                 try { la.startShortcut(s, null, null) } catch (_: Exception) { c.toast("Cannot open shortcut") }
-            }
+            })
         }
 
         if (c.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
@@ -343,9 +343,9 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                 )?.use {
                     while (it.moveToNext() && cs.size < 6) {
                         val uri = ContactsContract.Contacts.getLookupUri(it.getLong(0), it.getString(1))
-                        cs += Result(false, it.getString(2) ?: "Contact", "Contact") {
+                        cs += Result(false, it.getString(2) ?: "Contact", "Contact", action = {
                             Launch.start(c, Intent(Intent.ACTION_VIEW, uri))
-                        }
+                        })
                     }
                 }
             } catch (_: Exception) {}
@@ -356,14 +356,14 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         if (fs.isNotEmpty()) {
             out += Result(true, "Files")
             val visibleFiles = if (showAllFiles) fs else fs.take(5)
-            for (f in visibleFiles) out += Result(false, f.name, f.parent ?: "", Icons.file(f), f) {
+            for (f in visibleFiles) out += Result(false, f.name, f.parent ?: "", Icons.file(f), f, action = {
                 if (f.extension == "desktoplink") {
                     try {
                         val target = f.readLines().getOrNull(1)?.let { File(it) }
                         if (target != null && target.exists()) Files.open(c, target) else c.toast("Shortcut target not found")
                     } catch (_: Exception) { c.toast("Invalid shortcut") }
                 } else Files.open(c, f)
-            }
+            })
             if (fs.size > 5) {
                 val toggleLabel = if (showAllFiles) "Hide all files" else "See all files"
                 val toggleSub = if (showAllFiles) "Show only the first 5 results" else "Show all matching results"
