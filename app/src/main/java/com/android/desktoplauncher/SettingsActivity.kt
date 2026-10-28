@@ -162,7 +162,7 @@ class SettingsActivity : Activity() {
         sb.max = 44
         sb.progress = Prefs.tbDp(this) - 36
         sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { h.text = UiText.text(this, "Taskbar height") + ": ${p + 36} dp" }
+            override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { h.text = UiText.text(this@SettingsActivity, "Taskbar height") + ": ${p + 36} dp" }
             override fun onStartTrackingTouch(s: SeekBar?) {}
             override fun onStopTrackingTouch(s: SeekBar?) { Prefs.setTbDp(this@SettingsActivity, (s?.progress ?: 12) + 36) }
         })
