@@ -8,7 +8,7 @@ import android.view.View.LAYOUT_DIRECTION_RTL
 /** Small built-in English/Urdu UI dictionary and independent layout-direction preference. */
 object UiText {
     private val ur = mapOf(
-        "Desktop Launcher" to "ڈیسک ٹاپ لانچر", "Settings" to "ترتیبات", "ICONS" to "آئیکنز",
+        "Desktop Launcher" to "ڈیسک ٹاپ لانچر", "Apps" to "ایپس", "Settings" to "ترتیبات", "ICONS" to "آئیکنز",
         "Choose language and reading direction" to "زبان اور پڑھنے کی سمت منتخب کریں",
         "Icon size and app appearance" to "آئیکنز کا سائز اور ایپس کی ظاہری شکل",
         "Phone or desktop layout" to "فون یا ڈیسک ٹاپ لے آؤٹ",

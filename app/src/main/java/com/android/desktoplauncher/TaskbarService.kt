@@ -32,6 +32,7 @@ interface TaskbarHost {
     fun global(action: Int)
     fun hideRunning(pkg: String)
     fun toggleDrawer()
+    fun openSearch()
     val imeShown: Boolean
     fun pickIme()
 }
@@ -136,19 +137,29 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
             }
         } catch (_: Exception) {}
         var changed = false
-        if (running.toSet() != vis.toSet()) {
-            running.clear()
-            running.addAll(vis.take(10))
+        // Keep a short recent-app list, not just windows visible on this exact frame.
+        // Android may remove an app's window when another app comes to the front even
+        // though the app is still present in Recents.
+        for (p in vis) {
+            if (running.remove(p)) changed = true
+            running.add(p)
             changed = true
         }
+        while (running.size > 10) { running.remove(running.first()); changed = true }
         if (fg != focused) { focused = fg; changed = true }
         val ime = imeWin || editing
         if (ime != imeShown) { imeShown = ime; changed = true }
         if (changed) bar?.refresh()
+        // Accessibility events also arrive when the keyguard is shown/hidden.
+        sync()
     }
 
     override fun hideRunning(pkg: String) { running.remove(pkg); bar?.refresh() }
     override fun global(action: Int) { performGlobalAction(action) }
+    override fun openSearch() {
+        if (drawer == null) openDrawer()
+        drawer?.post { drawer?.focusSearch() }
+    }
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -158,7 +169,8 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
     /** Re-reads preferences: adds/removes the bar and updates its size. */
     private fun sync() {
         try {
-            if (!Prefs.bool(this, Prefs.K_TASKBAR, true) || !Modes.tablet(this)) {
+            val keyguardLocked = try { getSystemService(android.app.KeyguardManager::class.java)?.isKeyguardLocked == true } catch (_: Exception) { false }
+            if (!Prefs.bool(this, Prefs.K_TASKBAR, true) || !Modes.tablet(this) || keyguardLocked) {
                 removeBar(); closeDrawer(); return
             }
             val b = bar
@@ -280,7 +292,13 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
 
         center.addView(StartButton(ctx).also {
             it.background = ripple()
+            it.contentDescription = UiText.text(ctx, "Apps")
             it.setOnClickListener { svc.toggleDrawer() }
+        }, LinearLayout.LayoutParams(cell, MATCH))
+        center.addView(SearchButton(ctx).also {
+            it.background = ripple()
+            it.contentDescription = UiText.text(ctx, "Search")
+            it.setOnClickListener { svc.openSearch() }
         }, LinearLayout.LayoutParams(cell, MATCH))
 
         val pinned = Prefs.list(ctx, Prefs.K_PINNED).mapNotNull { ComponentName.unflattenFromString(it) }
@@ -425,5 +443,21 @@ class NavButton(c: Context, private val kind: Int) : View(c) {
             1 -> canvas.drawCircle(cx, cy, r, p)
             else -> canvas.drawRoundRect(RectF(cx - r, cy - r, cx + r, cy + r), r * 0.35f, r * 0.35f, p)
         }
+    }
+}
+
+
+/** Dedicated taskbar search shortcut, placed beside the app-drawer button. */
+class SearchButton(c: Context) : View(c) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        p.color = Colors.text(context)
+        p.strokeWidth = context.dp(2).toFloat()
+        val r = minOf(width, height) * 0.17f
+        val cx = width / 2f - r * 0.18f
+        val cy = height / 2f - r * 0.18f
+        canvas.drawCircle(cx, cy, r, p)
+        canvas.drawLine(cx + r * 0.72f, cy + r * 0.72f, cx + r * 1.55f, cy + r * 1.55f, p)
     }
 }

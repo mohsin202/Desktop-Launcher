@@ -59,6 +59,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     private val bg = Executors.newSingleThreadExecutor()
     private var gen = 0
     private var activeQuery = ""
+    private var keyboardDismissedThisGesture = false
     @Volatile private var showAllFiles = false
     private val allApps: List<AppInfo> = AppRepo.apps(c)
     private var apps: List<AppInfo> = allApps
@@ -136,7 +137,11 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         UiText.applyDirection(panel, c)
         UiText.applyDirection(search, c)
         isClickable = true
-        setOnClickListener { onClose() }
+        setOnClickListener {
+            // The first outside tap that dismissed the keyboard must not also close the drawer.
+            if (keyboardDismissedThisGesture) keyboardDismissedThisGesture = false
+            else if (!hideKeyboardIfVisible()) onClose()
+        }
         val dm = c.resources.displayMetrics
         val pw = if (wide) dm.widthPixels - c.dp(16) else minOf(c.dp(440), dm.widthPixels - c.dp(16))
         val ph = if (wide) (dm.heightPixels * 0.86f).toInt() else minOf(c.dp(580), (dm.heightPixels * 0.78f).toInt())
@@ -219,6 +224,22 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         return first.top >= target.paddingTop
     }
 
+    private fun hideKeyboardIfVisible(): Boolean {
+        val visible = try { rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true } catch (_: Exception) { false }
+        if (!visible && !search.hasFocus()) return false
+        val imm = c.getSystemService(InputMethodManager::class.java)
+        val token = search.windowToken
+        if (token != null) imm?.hideSoftInputFromWindow(token, 0)
+        search.clearFocus()
+        return visible
+    }
+
+    fun focusSearch() {
+        search.requestFocus()
+        val imm = c.getSystemService(InputMethodManager::class.java)
+        search.post { imm?.showSoftInput(search, InputMethodManager.SHOW_IMPLICIT) }
+    }
+
     /** Called after the view is attached. */
     fun onShown() {
         search.requestFocus()
@@ -226,6 +247,21 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             val imm = c.getSystemService(InputMethodManager::class.java)
             search.postDelayed({ imm?.showSoftInput(search, InputMethodManager.SHOW_IMPLICIT) }, 180)
         }
+    }
+
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+            val loc = IntArray(2)
+            search.getLocationOnScreen(loc)
+            val inSearch = ev.rawX >= loc[0] && ev.rawX <= loc[0] + search.width &&
+                ev.rawY >= loc[1] && ev.rawY <= loc[1] + search.height
+            if (!inSearch && hideKeyboardIfVisible()) keyboardDismissedThisGesture = true
+        }
+        val handled = super.dispatchTouchEvent(ev)
+        if (ev.actionMasked == android.view.MotionEvent.ACTION_UP || ev.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
+            post { keyboardDismissedThisGesture = false }
+        }
+        return handled
     }
 
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {

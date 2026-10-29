@@ -96,6 +96,10 @@ class LauncherActivity : Activity() {
         override fun global(action: Int) {}
         override fun hideRunning(pkg: String) {}
         override fun toggleDrawer() { this@LauncherActivity.toggleDrawer() }
+        override fun openSearch() {
+            if (drawer == null) toggleDrawer()
+            drawer?.post { drawer?.focusSearch() }
+        }
         override val imeShown = false
         override fun pickIme() {}
     }
@@ -233,7 +237,7 @@ class LauncherActivity : Activity() {
 
         val search = EditText(this).apply {
             hint = UiText.text(this@LauncherActivity, "Search")
-            setSingleLine(true)
+            singleLine = true
             inputType = InputType.TYPE_CLASS_TEXT
             textSize = 16f
             setTextColor(Colors.text(this@LauncherActivity))
@@ -278,7 +282,7 @@ class LauncherActivity : Activity() {
         panel.addView(divider, LinearLayout.LayoutParams(MATCH, dp(1)))
         val scroll = ScrollView(this).apply { isFillViewport = true; clipToPadding = false }
         val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        scroll.addView(rows, FrameLayout.LayoutParams(MATCH, WRAP))
+        scroll.addView(rows, ScrollView.LayoutParams(MATCH, WRAP))
         panel.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
         val cancel = TextView(this).apply {
             text = UiText.text(this@LauncherActivity, "Cancel")
