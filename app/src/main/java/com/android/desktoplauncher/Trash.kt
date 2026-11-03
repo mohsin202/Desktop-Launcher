@@ -137,8 +137,17 @@ open class TrashActivity : Activity() {
         super.onCreate(b)
         // Desktop/tablet: a translucent activity cannot show the launcher behind it on freeform ROMs (black background),
         // so hand over to a normal resizable activity in its own task and let the system draw it as a real window.
-        if (!windowed && (Modes.tablet(this) || Prefs.bool(this, Prefs.K_FREEFORM, false))) {
+        // BassOS can provide system Freeform even when this launcher's own Freeform
+        // preference is off. When the OS-level feature is already enabled, use the
+        // separate resizable Trash task instead of drawing the phone-style overlay
+        // inside the default Home task.
+        val systemFreeform = try {
+            android.provider.Settings.Global.getInt(contentResolver, "enable_freeform_support", 0) == 1 &&
+                android.provider.Settings.Global.getInt(contentResolver, "freeform_window_management", 0) == 1
+        } catch (_: Throwable) { false }
+        if (!windowed && (Modes.tablet(this) || Prefs.bool(this, Prefs.K_FREEFORM, false) || systemFreeform)) {
             try {
+                Launch.ensureFreeform(this)
                 val dm = resources.displayMetrics
                 val w = minOf(dp(560), dm.widthPixels - dp(48)); val h = minOf(dp(720), (dm.heightPixels * 0.8f).toInt())
                 val l = (dm.widthPixels - w) / 2; val t = (dm.heightPixels - h) / 2
