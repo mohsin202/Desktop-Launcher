@@ -421,20 +421,14 @@ object Launch {
         } catch (_: Throwable) { }
     }
 
-    /**
-     * Starts Taskbar's invisible 1x1 freeform task. Returns true only when a new helper
-     * task was requested, so the real app can be launched after Android has had time
-     * to create that freeform task. Launching both activities back-to-back is racy on
-     * some phone ROMs: the app wins the race and opens fullscreen.
-     */
-    private fun startHack(c: Context): Boolean {
-        if (!Prefs.bool(c, Prefs.K_FFHACK, false) || FreeformHackActivity.running()) return false
-        return try {
+    /** Opens the invisible freeform helper window once (Taskbar's "freeform hack"), if the setting is on. */
+    private fun startHack(c: Context) {
+        if (!Prefs.bool(c, Prefs.K_FFHACK, false) || FreeformHackActivity.running()) return
+        try {
             c.startActivity(Intent(c, FreeformHackActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION),
                 options(c, android.graphics.Rect(0, 0, 1, 1)))
-            true
-        } catch (_: Throwable) { false }
+        } catch (_: Throwable) { }
     }
 
     /** Window sizes of the "Window size" choice: 0 phone, 1 tablet, 2 desktop (in dp, clamped to the screen). */
@@ -465,25 +459,24 @@ object Launch {
     }
 
     fun start(c: Context, i: Intent, size: Int? = null) {
-        val freeformRequested = Prefs.bool(c, Prefs.K_FREEFORM, false) || size != null
-        if (freeformRequested) ensureFreeform(c)
-
-        // Give the helper activity time to become a real freeform task before starting
-        // the requested app. This mirrors Taskbar's persistent freeform-task workaround.
-        val helperStarted = freeformRequested && startHack(c)
-        val launch = {
-            try {
-                c.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), options(c, null, size))
-            } catch (e: Exception) { c.toast("Cannot open") }
-        }
-        if (helperStarted) {
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(launch, 350L)
-        } else launch()
+        if (Prefs.bool(c, Prefs.K_FREEFORM, false) || size != null) { ensureFreeform(c); startHack(c) }
+        try { c.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), options(c, null, size)) } catch (e: Exception) { c.toast("Cannot open") }
     }
 
     fun app(c: Context, comp: ComponentName, size: Int? = null) {
-        start(c, Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(comp)
-            .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED), size)
+        // Activities belonging to this launcher (Trash, Settings, etc.) must be launched
+        // as explicit in-app components, not as HOME/launcher-category launches.
+        // CATEGORY_LAUNCHER + RESET_TASK_IF_NEEDED can make some desktop ROMs treat
+        // the activity as part of the default Home task and keep it fullscreen.
+        val intent = if (comp.packageName == c.packageName) {
+            Intent().setComponent(comp)
+        } else {
+            Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+                .setComponent(comp)
+                .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        }
+        start(c, intent, size)
     }
 
     /** "Window size >" sub menu (Phone / Tablet / Desktop) for the menu of an app icon. */
