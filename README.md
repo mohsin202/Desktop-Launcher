@@ -34,3 +34,11 @@ If Android blocks the accessibility toggle (restricted setting) run as root:
 - Smallest width **>= 600 dp**: the dock merges into the taskbar (accessibility overlay, over every app, fullscreen or windowed),
   Back/Home/Recents move into it, desktop icons fill columns.
 - Both layouts use the same desktop-style taskbar look. Colours follow the wallpaper (Material You, Android 12+).
+
+## Widgets (grid based)
+- Widgets always snap to the home screen grid (whole cells). Long-press a widget: resize frame with corner handles (drag the widget body to move it); long-press again: Remove.
+- Built-in launcher widgets (Widgets menu): Clock (digital), Clock (analog), Search bar.
+
+## Taskbar notes
+- The taskbar is always left-to-right. Only the app strip scrolls; its position is kept; opening an app scrolls it into view.
+- Running lines are removed when an app disappears from Recents (needs the ROM to expose other apps' processes, or the Recents "Clear all" button).
