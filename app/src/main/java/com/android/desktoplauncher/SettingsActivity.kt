@@ -38,8 +38,8 @@ class SettingsActivity : Activity() {
         UiText.applyDirection(sv, this)
         setContentView(sv)
         sv.setOnApplyWindowInsetsListener { v, ins ->
-            val bars = ins.getInsets(WindowInsets.Type.systemBars())
-            v.setPadding(0, bars.top, 0, bars.bottom)
+            val bars = Insets.of(ins)
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             ins
         }
         build()
@@ -189,8 +189,9 @@ class SettingsActivity : Activity() {
         rg.check(100 + Prefs.iconMode(this))
         rg.setOnCheckedChangeListener { _, id -> Prefs.setIconMode(this, id - 100) }
         addSetting(rg)
-        sw(UiText.text(this, "App drawer themed icons"), Prefs.K_THEMED, false)
-        note(UiText.text(this, "Uses the wallpaper colours for apps that provide a monochrome icon (Android 13+)."))
+        sw(UiText.text(this, "Enable themed icons"), Prefs.K_THEMED, false)
+        sw(UiText.text(this, "Themed icon on unsupported icons"), Prefs.K_THEMED_ALL, false)
+        note(UiText.text(this, "Applies to the home screen and the app drawer. Apps without a monochrome icon are turned into one-colour icons when the second option is on."))
         sw(UiText.text(this, "Show notification dots"), Prefs.K_DOTS, true)
         val notifOn = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")?.contains(packageName) == true
         if (!notifOn) btn(UiText.text(this, "Allow notification access (needed for dots)")) { go(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
@@ -211,9 +212,56 @@ class SettingsActivity : Activity() {
 
         head("APPEARANCE")
         sw(UiText.text(this, "Enable UI blur"), Prefs.K_BLUR, false)
+        sw(UiText.text(this, "Enable glass blur"), Prefs.K_GLASS, false)
+        note(UiText.text(this, "Makes the app drawer, menus, folders, widget sheet and taskbar frosted glass, like the Glass style of the special clock."))
         note(UiText.text(this, "Blurs only overlay windows such as the taskbar and menus. When off, solid Material You colours are used."))
         sw(UiText.text(this, "Show keyboard when app drawer opens"), Prefs.K_DRAWER_IME, false)
         note(UiText.text(this, "When off, the app drawer opens without automatically showing the keyboard. Back should hide the keyboard before closing the drawer."))
+
+        head("WINDOWS")
+        sw(UiText.text(this, "Open apps in freeform windows"), Prefs.K_FREEFORM, false)
+        note(UiText.text(this, "Apps opened from the home screen, app drawer, taskbar and search open in resizable windows, if the system allows it."))
+        val wg = RadioGroup(this)
+        listOf("Phone", "Tablet", "Desktop").forEachIndexed { i, n ->
+            val r = RadioButton(this)
+            r.text = UiText.text(this, n)
+            r.id = 300 + i
+            r.setTextColor(Colors.text(this))
+            r.setPadding(dp(2), dp(7), dp(2), dp(7))
+            wg.addView(r)
+        }
+        wg.check(300 + Prefs.getInt(this, Prefs.K_WINSIZE, 2))
+        wg.setOnCheckedChangeListener { _, id -> Prefs.setInt(this, Prefs.K_WINSIZE, id - 300) }
+        addSetting(wg)
+        note(UiText.text(this, "Window size. You can also pick a size for one app from its menu: Window size."))
+        sw(UiText.text(this, "Freeform helper window (older Android)"), Prefs.K_FFHACK, false)
+        note(UiText.text(this, "Opens an invisible 1x1 freeform window first, like the Taskbar app does, so that apps opened afterwards also open as windows."))
+        note(UiText.text(this, "Special permission (optional)") + ": " + UiText.text(this, if (Launch.hasSecure(this)) "granted" else "not granted — tap the button to copy the adb command"))
+        btn(UiText.text(this, if (Launch.hasSecure(this)) "Switch on system freeform support" else "Copy adb command for the special permission")) {
+            if (Launch.hasSecure(this)) toast(UiText.text(this, if (Launch.ensureFreeform(this)) "Freeform support is on" else "Could not change the system setting"))
+            else {
+                (getSystemService(android.content.ClipboardManager::class.java)).setPrimaryClip(android.content.ClipData.newPlainText("adb", Launch.ADB_GRANT))
+                toast(UiText.text(this, "Copied. Run it from a computer with adb, then reopen the settings."))
+            }
+        }
+
+        head("PERMISSIONS")
+        note(UiText.text(this, "Special accesses the launcher can use. Each button opens the system screen where you turn it on."))
+        val usageOn = try {
+            val ao = getSystemService(android.app.AppOpsManager::class.java)
+            ao.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), packageName) == android.app.AppOpsManager.MODE_ALLOWED
+        } catch (_: Throwable) { false }
+        val pkgUri = Uri.parse("package:$packageName")
+        fun perm(name: String, on: Boolean, open: () -> Unit) {
+            note(UiText.text(this, name) + ": " + UiText.text(this, if (on) "granted" else "not granted"))
+            if (!on) btn(UiText.text(this, "Allow") + " — " + UiText.text(this, name)) { open() }
+        }
+        perm("Usage access", usageOn) { go(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS, pkgUri)) }
+        perm("Display over other apps", Settings.canDrawOverlays(this)) { go(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkgUri)) }
+        perm("Modify system settings", Settings.System.canWrite(this)) { go(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, pkgUri)) }
+        perm("All files access", Environment.isExternalStorageManager()) { go(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, pkgUri)) }
+        perm("Accessibility (taskbar)", TaskbarService.instance != null) { go(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+        perm("Notification access", notifOn) { go(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }
 
         head("TASKBAR / DOCK")
         val sw600 = resources.configuration.smallestScreenWidthDp

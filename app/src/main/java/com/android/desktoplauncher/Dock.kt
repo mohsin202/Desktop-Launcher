@@ -14,7 +14,7 @@ class DockView(private val ctx: Context) : LinearLayout(ctx) {
     init {
         orientation = HORIZONTAL
         gravity = Gravity.CENTER
-        background = Colors.rounded((Colors.taskbar(ctx) and 0x00FFFFFF) or 0xE6000000.toInt(), ctx.dp(30).toFloat())
+        background = Colors.panel(ctx, (Colors.taskbar(ctx) and 0x00FFFFFF) or 0xE6000000.toInt(), ctx.dp(30).toFloat())
         setPadding(ctx.dp(12), ctx.dp(8), ctx.dp(12), ctx.dp(8))
         reload()
     }
@@ -34,12 +34,14 @@ class DockView(private val ctx: Context) : LinearLayout(ctx) {
             val show = { x: Int, y: Int ->
                 menu?.dismiss()
                 val m = PopupMenuX(ctx, this)
+                m.spotlight = f
                 menu = m
                 val loc = IntArray(2)
                 getLocationOnScreen(loc)
                 m.show(x, loc[1], listOf(
                     MenuItem("Open") { Launch.app(ctx, comp) },
                     MenuItem("App Info") { Launch.info(ctx, comp.packageName) },
+                    Launch.sizeMenu(ctx, comp),
                     MenuItem("Remove from dock") { Prefs.toggleInList(ctx, Prefs.K_PINNED, comp.flattenToString()) }
                 ), above = true)
             }

@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
@@ -98,6 +99,25 @@ object Colors {
         if (night(c)) sys(c, android.R.color.system_accent1_100, 0xFFD3E3FD.toInt())
         else sys(c, android.R.color.system_accent1_800, 0xFF1F3A66.toInt())
 
+    fun glassOn(c: Context) = Prefs.bool(c, Prefs.K_GLASS, false)
+
+    /** A panel background: the plain colour, or (glass blur on) frosted glass like the special clock's Glass style. */
+    fun panel(c: Context, base: Int, r: Float, radii: FloatArray? = null): Drawable {
+        fun shape(f: GradientDrawable.() -> Unit) = GradientDrawable().apply {
+            if (radii != null) cornerRadii = radii else cornerRadius = r
+            f()
+        }
+        if (!glassOn(c)) return shape { setColor(base) }
+        val night = night(c)
+        val tint = shape { setColor((base and 0x00FFFFFF) or (if (night) 0x70000000 else 0x58000000)) }
+        val sheen = shape {
+            orientation = GradientDrawable.Orientation.TOP_BOTTOM
+            colors = intArrayOf(if (night) 0x4DFFFFFF else 0x99FFFFFF.toInt(), if (night) 0x12FFFFFF else 0x2EFFFFFF)
+            setStroke(c.dp(1).coerceAtLeast(1), 0xB3FFFFFF.toInt())
+        }
+        return android.graphics.drawable.LayerDrawable(arrayOf(tint, sheen))
+    }
+
     fun rounded(color: Int, r: Float) = GradientDrawable().apply { setColor(color); cornerRadius = r }
 }
 
@@ -109,6 +129,17 @@ object Blur {
         if (Build.VERSION.SDK_INT < 31) return
         lp.flags = lp.flags and android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
         lp.blurBehindRadius = 0
+    }
+
+    /** Real blur of what is behind an overlay: the launcher's own views are blurred while a drawer / menu is open. */
+    fun behind(c: Context, v: View?, on: Boolean) {
+        if (v == null || Build.VERSION.SDK_INT < 31) return
+        try {
+            if (on && (Prefs.bool(c, Prefs.K_BLUR, false) || Prefs.bool(c, Prefs.K_GLASS, false))) {
+                val r = c.dp(14).toFloat()
+                v.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(r, r, android.graphics.Shader.TileMode.CLAMP))
+            } else v.setRenderEffect(null)
+        } catch (_: Throwable) { }
     }
 
     /** Keep popups touch-safe; bounded glass blur needs a Window-backed surface. */
@@ -129,24 +160,97 @@ object Blur {
 object Icons {
     private val cache = ConcurrentHashMap<String, Drawable.ConstantState>()
 
-    fun app(c: Context, comp: ComponentName, themed: Boolean): Drawable {
-        val key = comp.flattenToString() + (if (themed) "#t" else "") + (if (Colors.night(c)) "n" else "d")
+    /** Home screen and drawer both use the two settings: "themed icons" and "themed icon on unsupported icons". */
+    fun app(c: Context, comp: ComponentName, @Suppress("UNUSED_PARAMETER") themed: Boolean = false): Drawable {
+        val on = Prefs.bool(c, Prefs.K_THEMED, false)
+        val all = on && Prefs.bool(c, Prefs.K_THEMED_ALL, false)
+        val key = comp.flattenToString() + (if (on) (if (all) "#ta" else "#t") else "") + (if (Colors.night(c)) "n" else "d")
         cache[key]?.let { return it.newDrawable().mutate() }
         val d: Drawable = try {
             val base = c.packageManager.getActivityIcon(comp)
-            if (themed && Build.VERSION.SDK_INT >= 33 && base is AdaptiveIconDrawable) {
-                val mono = base.monochrome
+            if (!on) base else {
+                var mono: Drawable? = null
+                if (Build.VERSION.SDK_INT >= 33 && base is AdaptiveIconDrawable) mono = base.monochrome
                 if (mono != null) {
                     val fg = mono.constantState?.newDrawable()?.mutate() ?: mono
                     fg.setTint(Colors.iconFg(c))
                     AdaptiveIconDrawable(ColorDrawable(Colors.iconBg(c)), fg)
-                } else base
-            } else base
+                } else if (all) makeMono(c, base) else base
+            }
         } catch (e: Exception) {
             c.packageManager.defaultActivityIcon
         }
         d.constantState?.let { cache[key] = it }
         return d
+    }
+
+    /**
+     * Themed version of an icon that has no monochrome layer: the real picture stays recognisable, only its colours
+     * are replaced by the Material You pair; the plate always follows the theme (light plate in light mode, dark plate in dark mode).
+     */
+    private fun makeMono(c: Context, base: Drawable): Drawable {
+        val n = 216
+        val bmp = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
+        val cv = Canvas(bmp)
+        val adaptive = base is AdaptiveIconDrawable
+        if (adaptive) base.setBounds(0, 0, n, n)
+        else { val m = (n * 0.19f).toInt(); base.setBounds(m, m, n - m, n - m) }
+        base.draw(cv)
+        val px = IntArray(n * n)
+        bmp.getPixels(px, 0, n, 0, 0, n, n)
+        val lum = FloatArray(n * n)
+        for (i in px.indices) {
+            val p = px[i]
+            lum[i] = (0.299f * ((p shr 16) and 255) + 0.587f * ((p shr 8) and 255) + 0.114f * (p and 255))
+        }
+        val plate = Colors.iconBg(c); val ink = Colors.iconFg(c)
+        fun mix(a: Int, b: Int, t: Float) = (a + (b - a) * t).toInt()
+        fun median(vals: List<Float>): Float = if (vals.isEmpty()) 128f else vals.sorted()[vals.size / 2]
+        // The plate always follows the theme (light plate in light mode, dark plate in dark mode), whatever the original
+        // background was. What differs from the icon's own background becomes the ink, so the picture stays recognisable.
+        var minX = n; var minY = n; var maxX = -1; var maxY = -1
+        for (y in 0 until n) for (x in 0 until n) if ((px[y * n + x] ushr 24) > 128) {
+            if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y
+        }
+        val border = ArrayList<Float>()
+        var ringTotal = 0
+        if (maxX > minX && maxY > minY) {
+            val bw = ((maxX - minX) * 0.1f).toInt().coerceAtLeast(2); val bh = ((maxY - minY) * 0.1f).toInt().coerceAtLeast(2)
+            for (y in minY..maxY) for (x in minX..maxX) {
+                if (x - minX < bw || maxX - x < bw || y - minY < bh || maxY - y < bh) {
+                    ringTotal++
+                    if ((px[y * n + x] ushr 24) > 200) border.add(lum[y * n + x])
+                }
+            }
+        }
+        val solidBg = ringTotal > 0 && border.size > ringTotal * 0.6f
+        val bg = median(border)
+        val tt = FloatArray(n * n)
+        if (solidBg) {
+            val d = ArrayList<Float>()
+            for (i in px.indices) if ((px[i] ushr 24) > 128) d.add(Math.abs(lum[i] - bg))
+            d.sort()
+            val dmax = maxOf(30f, if (d.isEmpty()) 30f else d[(d.size * 0.97f).toInt().coerceIn(0, d.size - 1)])
+            for (i in px.indices) tt[i] = (Math.abs(lum[i] - bg) / dmax).coerceIn(0f, 1f)
+        } else {
+            // a shape without its own background (transparent around it): solid ink with a little shading
+            val inside = ArrayList<Float>()
+            for (i in px.indices) if ((px[i] ushr 24) > 128) inside.add(lum[i])
+            val m = median(inside)
+            for (i in px.indices) tt[i] = (0.8f + 0.2f * (Math.abs(lum[i] - m) / 128f)).coerceIn(0f, 1f)
+        }
+        for (i in px.indices) {
+            val a = px[i] ushr 24
+            if (a == 0) { px[i] = 0; continue }
+            val t = tt[i]
+            val r = mix((plate shr 16) and 255, (ink shr 16) and 255, t)
+            val g = mix((plate shr 8) and 255, (ink shr 8) and 255, t)
+            val bl = mix(plate and 255, ink and 255, t)
+            px[i] = (a shl 24) or (r shl 16) or (g shl 8) or bl
+        }
+        bmp.setPixels(px, 0, n, 0, 0, n, n)
+        val out = android.graphics.drawable.BitmapDrawable(c.resources, bmp)
+        return if (adaptive) out else AdaptiveIconDrawable(ColorDrawable(plate), out)
     }
 
     fun file(f: File): Drawable =
@@ -247,7 +351,7 @@ object Files {
         if (f.isDirectory) { openFolder(c, f); return }
         val i = Intent(Intent.ACTION_VIEW).setDataAndType(uri(f), mime(f))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        try { c.startActivity(i) } catch (e: Exception) { c.toast("No app can open this file") }
+        try { c.startActivity(i, Launch.options(c)) } catch (e: Exception) { c.toast("No app can open this file") }
     }
 
     fun openFolder(c: Context, f: File) {
@@ -279,14 +383,115 @@ object Files {
 }
 
 object Launch {
-    fun start(c: Context, i: Intent) {
-        try { c.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (e: Exception) { c.toast("Cannot open") }
+    /**
+     * Launch options for "Open apps in freeform windows": asks for the freeform windowing mode (hidden API, may be refused by
+     * the ROM) and a window rectangle, like taskbar apps do. Returns null when the setting is off and no bounds are given.
+     */
+    const val ADB_GRANT = "adb shell pm grant com.android.desktoplauncher android.permission.WRITE_SECURE_SETTINGS"
+
+    fun hasSecure(c: Context) = c.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Switches on the system's freeform window support (Settings.Global enable_freeform_support / force_resizable_activities /
+     * freeform_window_management), like the Taskbar app. Needs the WRITE_SECURE_SETTINGS permission given once with adb.
+     */
+    fun ensureFreeform(c: Context): Boolean {
+        if (!hasSecure(c)) return false
+        return try {
+            val r = c.contentResolver
+            Settings.Global.putInt(r, "enable_freeform_support", 1)
+            Settings.Global.putInt(r, "force_resizable_activities", 1)
+            Settings.Global.putInt(r, "freeform_window_management", 1)
+            true
+        } catch (_: Throwable) { false }
     }
 
-    fun app(c: Context, comp: ComponentName) {
-        start(c, Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(comp)
-            .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED))
+    private var hiddenOpen = false
+    /** Android hides some framework calls (here: asking for the freeform windowing mode). Lifts that restriction for this app. */
+    private fun unlockHidden() {
+        if (hiddenOpen) return
+        hiddenOpen = true
+        try {
+            val forName = Class::class.java.getDeclaredMethod("forName", String::class.java)
+            val getDeclared = Class::class.java.getDeclaredMethod("getDeclaredMethod", String::class.java, java.lang.reflect.Array.newInstance(Class::class.java, 0).javaClass)
+            val vm = forName.invoke(null, "dalvik.system.VMRuntime") as Class<*>
+            val getRuntime = getDeclared.invoke(vm, "getRuntime", arrayOfNulls<Class<*>>(0)) as java.lang.reflect.Method
+            val setEx = getDeclared.invoke(vm, "setHiddenApiExemptions", arrayOf<Class<*>>(Array<String>::class.java)) as java.lang.reflect.Method
+            setEx.invoke(getRuntime.invoke(null), arrayOf("L"))
+        } catch (_: Throwable) { }
     }
+
+    /**
+     * Starts Taskbar's invisible 1x1 freeform task. Returns true only when a new helper
+     * task was requested, so the real app can be launched after Android has had time
+     * to create that freeform task. Launching both activities back-to-back is racy on
+     * some phone ROMs: the app wins the race and opens fullscreen.
+     */
+    private fun startHack(c: Context): Boolean {
+        if (!Prefs.bool(c, Prefs.K_FFHACK, false) || FreeformHackActivity.running()) return false
+        return try {
+            c.startActivity(Intent(c, FreeformHackActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION),
+                options(c, android.graphics.Rect(0, 0, 1, 1)))
+            true
+        } catch (_: Throwable) { false }
+    }
+
+    /** Window sizes of the "Window size" choice: 0 phone, 1 tablet, 2 desktop (in dp, clamped to the screen). */
+    fun sizeRect(c: Context, size: Int): android.graphics.Rect {
+        val dm = c.resources.displayMetrics
+        val (wd, hd) = when (size) { 0 -> 400 to 720; 1 -> 820 to 620; else -> 1180 to 760 }
+        val w = minOf((wd * dm.density).toInt(), (dm.widthPixels * 0.94f).toInt())
+        val h = minOf((hd * dm.density).toInt(), (dm.heightPixels * 0.9f).toInt())
+        val l = (dm.widthPixels - w) / 2; val t = (dm.heightPixels - h) / 2
+        return android.graphics.Rect(l, t, l + w, t + h)
+    }
+
+    /**
+     * Launch options for freeform windows: asks for the freeform windowing mode (hidden API, may be refused by the ROM)
+     * and a window rectangle, like taskbar apps do. [size] (0 phone, 1 tablet, 2 desktop) forces a window of that size even
+     * when the setting is off; otherwise the saved window size is used. Returns null when nothing is asked for.
+     */
+    fun options(c: Context, bounds: android.graphics.Rect? = null, size: Int? = null): android.os.Bundle? {
+        val on = Prefs.bool(c, Prefs.K_FREEFORM, false) || size != null
+        if (!on && bounds == null) return null
+        return try {
+            val o = android.app.ActivityOptions.makeBasic()
+            if (on) unlockHidden()
+            if (on) try { o.javaClass.getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType).invoke(o, 5) } catch (_: Throwable) {}
+            o.setLaunchBounds(bounds ?: sizeRect(c, size ?: Prefs.getInt(c, Prefs.K_WINSIZE, 2)))
+            o.toBundle()
+        } catch (_: Throwable) { null }
+    }
+
+    fun start(c: Context, i: Intent, size: Int? = null) {
+        val freeformRequested = Prefs.bool(c, Prefs.K_FREEFORM, false) || size != null
+        if (freeformRequested) ensureFreeform(c)
+
+        // Give the helper activity time to become a real freeform task before starting
+        // the requested app. This mirrors Taskbar's persistent freeform-task workaround.
+        val helperStarted = freeformRequested && startHack(c)
+        val launch = {
+            try {
+                c.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), options(c, null, size))
+            } catch (e: Exception) { c.toast("Cannot open") }
+        }
+        if (helperStarted) {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(launch, 350L)
+        } else launch()
+    }
+
+    fun app(c: Context, comp: ComponentName, size: Int? = null) {
+        start(c, Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(comp)
+            .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED), size)
+    }
+
+    /** "Window size >" sub menu (Phone / Tablet / Desktop) for the menu of an app icon. */
+    fun sizeMenu(c: Context, comp: ComponentName): MenuItem = MenuItem("Window size", children = listOf(
+        MenuItem("Phone") { app(c, comp, 0) },
+        MenuItem("Tablet") { app(c, comp, 1) },
+        MenuItem("Desktop") { app(c, comp, 2) }
+    ))
 
     fun info(c: Context, pkg: String) =
         start(c, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$pkg")))
@@ -323,3 +528,14 @@ object Launch {
     }
 }
 
+
+/** Space taken by system bars and the display cutout (punch hole), so content never goes under them. */
+object Insets {
+    fun of(ins: android.view.WindowInsets): android.graphics.Insets =
+        ins.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+
+    fun safe(c: Context): android.graphics.Insets = try {
+        c.getSystemService(android.view.WindowManager::class.java).currentWindowMetrics.windowInsets
+            .getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+    } catch (_: Exception) { android.graphics.Insets.NONE }
+}

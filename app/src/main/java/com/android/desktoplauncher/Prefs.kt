@@ -18,6 +18,7 @@ object Bus {
 object Prefs {
     const val K_DOTS = "dots"
     const val K_THEMED = "themed"
+    const val K_THEMED_ALL = "themed_all"
     const val K_TASKBAR = "taskbar"
     const val K_NAV = "nav"
     const val K_TBH = "tbh"
@@ -25,7 +26,13 @@ object Prefs {
     const val K_DESKAPPS = "deskApps"
     const val K_HIDDEN = "hidden"
     const val K_WIDGETS = "widgets"
+    const val K_FREE = "freeWidgets"   // free-form clocks: "id,fx,fy,fw,fh" (fractions x10000 of the desktop)
+    const val K_LWIDGETS = "lwidgets" // built-in launcher widgets: "id:type"
     const val K_BLUR = "blur"
+    const val K_GLASS = "glassblur"
+    const val K_FREEFORM = "freeform"
+    const val K_WINSIZE = "winsize"
+    const val K_FFHACK = "ffhack"
     const val K_IME = "imebtn"
     const val K_POS = "pos"
     const val K_WINKEY = "winkey"
@@ -34,6 +41,9 @@ object Prefs {
     const val K_DRAWER_IME = "drawerIme"
     const val K_LANGUAGE = "uiLanguage" // 0 English, 1 Urdu
     const val K_DIRECTION = "uiDirection" // 0 system, 1 LTR, 2 RTL
+    const val K_FOLDERS = "folders" // desktop folders (see FolderStore)
+    const val K_RECENT = "recentSearches" // last searches, "|" separated
+    const val K_DL_DISMISSED = "dlDismissed" // time (ms) when the "downloaded today" card was closed
 
     private fun sp(c: Context): SharedPreferences =
         c.applicationContext.getSharedPreferences("desktop", Context.MODE_PRIVATE)
@@ -52,7 +62,13 @@ object Prefs {
 
     fun getInt(c: Context, k: String, d: Int) = sp(c).getInt(k, d)
     fun setInt(c: Context, k: String, v: Int) { sp(c).edit().putInt(k, v).apply(); Bus.fire() }
+    fun getStr(c: Context, k: String): String? = sp(c).getString(k, null)
+    fun setStr(c: Context, k: String, v: String?, fire: Boolean = true) {
+        sp(c).edit().apply { if (v == null) remove(k) else putString(k, v) }.apply(); if (fire) Bus.fire()
+    }
     fun has(c: Context, k: String) = sp(c).contains(k)
+    fun getLong(c: Context, k: String, d: Long) = sp(c).getLong(k, d)
+    fun setLong(c: Context, k: String, v: Long) { sp(c).edit().putLong(k, v).apply() }
 
     /** 0 = automatic (smallest width >= 600dp = desktop), 1 = always phone, 2 = always desktop */
     fun layoutMode(c: Context) = sp(c).getInt("layout", 0)

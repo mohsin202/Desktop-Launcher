@@ -42,7 +42,8 @@ class Result(
     val icon: Drawable? = null,
     val file: File? = null,
     val action: () -> Unit = {},
-    val keepOpen: Boolean = false
+    val keepOpen: Boolean = false,
+    val custom: (() -> View)? = null
 )
 
 /**
@@ -68,6 +69,22 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     private val themed = Prefs.bool(c, Prefs.K_THEMED, false)
     private val dots = Prefs.bool(c, Prefs.K_DOTS, true)
     private var menu: PopupMenuX? = null
+    private var searchMode = false
+    private var moreApps = false
+    private var dlFiles: List<Downloads.Entry> = emptyList()
+    private var dlExpanded = false
+    // resizable panel (desktop mode only): handle at the top corner opposite to the side the drawer sits on
+    private var centredMode = false
+    private var handleVisible = false
+    private var resizing = false
+    private var rx0 = 0f
+    private var ry0 = 0f
+    private var rw0 = 0
+    private var rh0 = 0
+    private val handlePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        style = android.graphics.Paint.Style.STROKE; strokeCap = android.graphics.Paint.Cap.ROUND
+    }
+    private var dlApps: List<AppInfo> = emptyList()
 
     private val gridAdapter = object : BaseAdapter() {
         override fun getCount() = apps.size
@@ -77,7 +94,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             val cell = (cv as? AppCell) ?: AppCell(c)
             val a = apps[p]
             cell.bind(a)
-            cell.setSecondaryClick { x, y -> showAppMenu(a, x, y) }
+            cell.setSecondaryClick { x, y -> showAppMenu(a, x, y, cell) }
             return cell
         }
     }
@@ -87,10 +104,12 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         override fun getItem(p: Int) = results[p]
         override fun getItemId(p: Int) = p.toLong()
         override fun areAllItemsEnabled() = false
-        override fun isEnabled(p: Int) = !results[p].header
+        override fun isEnabled(p: Int) = !results[p].header && results[p].custom == null
         override fun getView(p: Int, cv: View?, parent: ViewGroup?): View {
             val r = results[p]
-            val row = LinearLayout(c)
+            r.custom?.let { return it() }
+            val row = EmphRow(c, false)
+            row.plain = r.header || r.custom != null
             row.orientation = LinearLayout.HORIZONTAL
             row.gravity = Gravity.CENTER_VERTICAL
             if (r.header) {
@@ -104,7 +123,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                 row.setPadding(c.dp(12), c.dp(8), c.dp(12), c.dp(8))
                 if (r.icon != null) {
                     val iv = android.widget.ImageView(c)
-                    iv.setImageDrawable(r.icon)
+                    if (r.file != null) Thumbs.bind(iv, r.file, c.dp(36)) else iv.setImageDrawable(r.icon)
                     row.addView(iv, LinearLayout.LayoutParams(c.dp(36), c.dp(36)).also { it.rightMargin = c.dp(12) })
                 }
                 val col = LinearLayout(c)
@@ -143,15 +162,30 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             else if (!hideKeyboardIfVisible()) onClose()
         }
         val dm = c.resources.displayMetrics
-        val pw = if (wide) dm.widthPixels - c.dp(16) else minOf(c.dp(440), dm.widthPixels - c.dp(16))
-        val ph = if (wide) (dm.heightPixels * 0.86f).toInt() else minOf(c.dp(580), (dm.heightPixels * 0.78f).toInt())
+        var pw = if (wide) dm.widthPixels - c.dp(16) else minOf(c.dp(440), dm.widthPixels - c.dp(16))
+        var ph = if (wide) (dm.heightPixels * 0.86f).toInt() else minOf(c.dp(580), (dm.heightPixels * 0.78f).toInt())
+        if (!wide) {
+            // size the user chose last time
+            val sw = Prefs.getLong(c, "drawerWdp", 0L).toInt()
+            val sh = Prefs.getLong(c, "drawerHdp", 0L).toInt()
+            if (sw > 0) pw = c.dp(sw).coerceIn(c.dp(280), dm.widthPixels - c.dp(16))
+            if (sh > 0) ph = c.dp(sh).coerceIn(c.dp(320), (dm.heightPixels * 0.95f).toInt())
+        }
         panel.orientation = LinearLayout.VERTICAL
-        panel.background = Colors.rounded(Colors.surface(c), c.dp(28).toFloat())
+        panel.background = Colors.panel(c, Colors.surface(c), c.dp(28).toFloat())
         panel.elevation = c.dp(10).toFloat()
         panel.setPadding(c.dp(14), c.dp(14), c.dp(14), c.dp(10))
         panel.isClickable = true
-        val lp = LayoutParams(pw, ph, if (wide) Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL else Gravity.BOTTOM or Gravity.START)
-        if (!wide) lp.marginStart = c.dp(8)
+        // Portrait (and phone mode): centred. Landscape desktop: starts near the drawer button.
+        val portrait = dm.heightPixels > dm.widthPixels
+        val centred = wide || portrait
+        centredMode = centred
+        setWillNotDraw(false)
+        val lp = LayoutParams(pw, ph, if (centred) Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL else Gravity.BOTTOM or Gravity.START)
+        // keep clear of the punch hole / side navigation bar in landscape
+        val si = Insets.safe(c)
+        lp.leftMargin = si.left; lp.rightMargin = si.right
+        if (!centred) lp.marginStart = c.dp(8) + (if (Prefs.direction(c) == 2) si.right else si.left)
         lp.bottomMargin = bottomMargin
         addView(panel, lp)
 
@@ -175,7 +209,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         grid.setOnItemClickListener { _, _, p, _ -> launch(apps[p]) }
         var lx = 0; var ly = 0
         grid.setOnTouchListener { _, ev -> lx = ev.rawX.toInt(); ly = ev.rawY.toInt(); false }
-        grid.setOnItemLongClickListener { _, _, p, _ -> showAppMenu(apps[p], lx, ly); true }
+        grid.setOnItemLongClickListener { _, v, p, _ -> showAppMenu(apps[p], lx, ly, v); true }
         val gp = LinearLayout.LayoutParams(MATCH, 0, 1f)
         gp.topMargin = c.dp(10)
         panel.addView(grid, gp)
@@ -183,10 +217,10 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         list.adapter = listAdapter
         list.divider = null
         list.visibility = GONE
-        list.setOnItemClickListener { _, _, p, _ -> results[p].let { if (!it.header) { it.action(); if (!it.keepOpen) onClose() } } }
+        list.setOnItemClickListener { _, _, p, _ -> results[p].let { if (!it.header && it.custom == null) { remember(); it.action(); if (!it.keepOpen) onClose() } } }
         list.setOnItemLongClickListener { _, v, p, _ ->
             val r = results.getOrNull(p) ?: return@setOnItemLongClickListener false
-            if (r.header) return@setOnItemLongClickListener true
+            if (r.header || r.custom != null) return@setOnItemLongClickListener true
             val loc = IntArray(2); v.getLocationOnScreen(loc)
             val items = ArrayList<MenuItem>()
             items += MenuItem("Open") { r.action(); onClose() }
@@ -198,18 +232,21 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                     c.toast("Shortcut created on Desktop")
                 } catch (_: Exception) { c.toast("Could not create shortcut") }
             } }
-            PopupMenuX(c, this).show(loc[0], loc[1] + v.height, items)
+            PopupMenuX(c, this).also { it.spotlight = v }.show(loc[0], loc[1] + v.height, items)
             true
         }
         panel.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f).also { it.topMargin = c.dp(6) })
 
+        search.setOnTouchListener { _, ev -> if (ev.actionMasked == android.view.MotionEvent.ACTION_UP) enterSearch(); false }
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, d: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, d: Int) {}
             override fun afterTextChanged(s: Editable?) { runSearch(s?.toString() ?: "") }
         })
         search.setOnEditorActionListener { _, _, _ ->
-            results.firstOrNull { !it.header }?.let { it.action(); onClose() }
+            remember()
+            if (activeQuery.isNotEmpty() && apps.isNotEmpty()) launch(apps[0])
+            else results.firstOrNull { !it.header && it.custom == null }?.let { it.action(); onClose() }
             true
         }
         loadShortcuts()
@@ -235,6 +272,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     }
 
     fun focusSearch() {
+        enterSearch()
         search.requestFocus()
         val imm = c.getSystemService(InputMethodManager::class.java)
         search.post { imm?.showSoftInput(search, InputMethodManager.SHOW_IMPLICIT) }
@@ -242,6 +280,11 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
 
     /** Called after the view is attached. */
     fun onShown() {
+        if (!wide) {
+            // show the resize handles for a moment so touch users can find them
+            handleVisible = true; invalidate()
+            postDelayed({ if (!resizing) { handleVisible = false; invalidate() } }, 2500)
+        }
         search.requestFocus()
         if (Prefs.bool(c, Prefs.K_DRAWER_IME, false) && c.resources.configuration.keyboard == android.content.res.Configuration.KEYBOARD_NOKEYS) {
             val imm = c.getSystemService(InputMethodManager::class.java)
@@ -249,7 +292,96 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         }
     }
 
+    private fun onLeftCorner() = !centredMode && layoutDirection == LAYOUT_DIRECTION_RTL
+
+    /** -1 = top left handle, +1 = top right handle, 0 = none. Centred drawers have both, side drawers only the far one. */
+    private fun handleSide(x: Float, y: Float): Int {
+        if (wide) return 0
+        val z = c.dp(48)
+        if (y < panel.top || y > panel.top + z) return 0
+        val leftOk = centredMode || onLeftCorner()
+        val rightOk = centredMode || !onLeftCorner()
+        if (leftOk && x >= panel.left && x <= panel.left + z) return -1
+        if (rightOk && x <= panel.right && x >= panel.right - z) return 1
+        return 0
+    }
+
+    private fun inHandleZone(x: Float, y: Float) = handleSide(x, y) != 0
+    private var activeSide = 1
+
+    override fun dispatchGenericMotionEvent(ev: android.view.MotionEvent): Boolean {
+        if (!wide && (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_MOVE || ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_ENTER)) {
+            val v = inHandleZone(ev.x, ev.y)
+            if (v != handleVisible) { handleVisible = v; invalidate() }
+        } else if (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_EXIT && handleVisible && !resizing) {
+            handleVisible = false; invalidate()
+        }
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    private fun resizeTouch(ev: android.view.MotionEvent): Boolean {
+        val lp = panel.layoutParams as LayoutParams
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                val side = handleSide(ev.x, ev.y)
+                if (side == 0) return false
+                activeSide = side
+                resizing = true; handleVisible = true
+                rx0 = ev.rawX; ry0 = ev.rawY; rw0 = lp.width; rh0 = lp.height
+                parent?.requestDisallowInterceptTouchEvent(true)
+                hideKeyboardIfVisible()
+                invalidate()
+                return true
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                if (!resizing) return false
+                val dm = c.resources.displayMetrics
+                val dx = ev.rawX - rx0
+                val dy = ev.rawY - ry0
+                val factor = if (centredMode) 2 else 1
+                val w = (rw0 + (if (activeSide < 0) -dx else dx) * factor).toInt().coerceIn(c.dp(280), dm.widthPixels - c.dp(16))
+                val maxH = (if (height > 0) height else dm.heightPixels) - lp.bottomMargin - c.dp(8)
+                val h = (rh0 - dy).toInt().coerceIn(c.dp(320), maxOf(c.dp(320), maxH))
+                if (w != lp.width || h != lp.height) {
+                    lp.width = w; lp.height = h
+                    panel.layoutParams = lp
+                    grid.numColumns = maxOf(3, (w - c.dp(28)) / c.dp(92))
+                }
+                return true
+            }
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                if (!resizing) return false
+                resizing = false
+                Prefs.setLong(c, "drawerWdp", (lp.width / c.resources.displayMetrics.density).toLong())
+                Prefs.setLong(c, "drawerHdp", (lp.height / c.resources.displayMetrics.density).toLong())
+                invalidate()
+                return true
+            }
+        }
+        return false
+    }
+
+    override fun dispatchDraw(canvas: android.graphics.Canvas) {
+        super.dispatchDraw(canvas)
+        if (!handleVisible || wide) return
+        handlePaint.color = Colors.accent(c)
+        handlePaint.strokeWidth = c.dp(4).toFloat()
+        val rad = c.dp(16).toFloat()
+        val inset = c.dp(8).toFloat()
+        if (centredMode || onLeftCorner()) {
+            val cx = panel.left + rad + inset; val cy = panel.top + rad + inset
+            canvas.drawArc(android.graphics.RectF(cx - rad, cy - rad, cx + rad, cy + rad), 185f, 80f, false, handlePaint)
+        }
+        if (centredMode || !onLeftCorner()) {
+            val cx = panel.right - rad - inset; val cy = panel.top + rad + inset
+            canvas.drawArc(android.graphics.RectF(cx - rad, cy - rad, cx + rad, cy + rad), 275f, 80f, false, handlePaint)
+        }
+    }
+
     override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (!wide && (resizing || ev.actionMasked == android.view.MotionEvent.ACTION_DOWN)) {
+            if (resizeTouch(ev)) return true
+        }
         if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
             val loc = IntArray(2)
             search.getLocationOnScreen(loc)
@@ -271,7 +403,9 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                 val imm = c.getSystemService(InputMethodManager::class.java)
                 imm?.hideSoftInputFromWindow(search.windowToken, 0)
                 search.clearFocus()
-            } else onClose()
+            } else if (moreApps) { moreApps = false; render() }
+            else if (searchMode) { searchMode = false; search.setText(""); runSearch("") }
+            else onClose()
             return true
         }
         return super.dispatchKeyEvent(e)
@@ -279,15 +413,17 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
 
     private fun launch(a: AppInfo) { Launch.app(c, a.comp); onClose() }
 
-    private fun showAppMenu(a: AppInfo, x: Int, y: Int) {
+    private fun showAppMenu(a: AppInfo, x: Int, y: Int, target: View? = null) {
         menu?.dismiss()
         val pinned = Prefs.list(c, Prefs.K_PINNED).contains(a.comp.flattenToString())
         val m = PopupMenuX(c, this)
+        m.spotlight = target
         menu = m
         m.show(x, y, listOf(
             MenuItem("Open") { launch(a) },
             MenuItem("App Info") { onClose(); Launch.info(c, a.pkg) },
             MenuItem("Share") { onClose(); Launch.shareApp(c, a.pkg) },
+            Launch.sizeMenu(c, a.comp).let { m0 -> MenuItem(m0.label, children = m0.children?.map { k -> MenuItem(k.label) { onClose(); k.action?.invoke() } }) },
             MenuItem(if (pinned) "Unpin from Taskbar" else "Pin to Taskbar") {
                 Prefs.toggleInList(c, Prefs.K_PINNED, a.comp.flattenToString())
             },
@@ -320,33 +456,275 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         }
     }
 
+    private fun enterSearch() {
+        if (searchMode) return
+        searchMode = true
+        runSearch(search.text?.toString() ?: "")
+    }
+
+    private fun render() {
+        val showList = (searchMode || activeQuery.isNotEmpty()) && !moreApps
+        list.visibility = if (showList) VISIBLE else GONE
+        grid.visibility = if (showList || apps.isEmpty()) GONE else VISIBLE
+    }
+
+    private fun remember() {
+        val q = activeQuery.replace("|", " ").trim()
+        if (q.isEmpty()) return
+        Prefs.setList(c, Prefs.K_RECENT, (listOf(q) + Prefs.list(c, Prefs.K_RECENT).filter { !it.equals(q, true) }).take(8), false)
+    }
+
+    private fun refreshHome() {
+        if (searchMode && activeQuery.isEmpty()) { results = homeResults(); listAdapter.notifyDataSetChanged() }
+    }
+
     private fun runSearch(q: String) {
         val query = q.trim()
         if (query != activeQuery) {
             activeQuery = query
             showAllFiles = false
+            moreApps = false
         }
+        if (query.isNotEmpty()) searchMode = true
         val my = ++gen
+        apps = if (query.isEmpty()) allApps else allApps.filter { it.label.contains(query, ignoreCase = true) }
+        gridAdapter.notifyDataSetChanged()
+        render()
+        if (!searchMode && query.isEmpty()) return
         if (query.isEmpty()) {
-            apps = allApps
-            gridAdapter.notifyDataSetChanged()
-            list.visibility = GONE
-            grid.visibility = VISIBLE
+            results = homeResults()
+            listAdapter.notifyDataSetChanged()
+            bg.execute {
+                val d = Downloads.recent(c)
+                val na = Downloads.newApps(c, allApps)
+                main.post { if (my == gen) { dlFiles = d; dlApps = na; refreshHome() } }
+            }
             return
         }
-        apps = allApps.filter { it.label.contains(query, ignoreCase = true) }
-        gridAdapter.notifyDataSetChanged()
-        grid.visibility = if (apps.isEmpty()) GONE else VISIBLE
-        list.visibility = VISIBLE
         bg.execute {
             val r = buildResults(query)
             main.post { if (my == gen) { results = r; listAdapter.notifyDataSetChanged() } }
         }
     }
 
+    private fun homeResults(): List<Result> {
+        val out = ArrayList<Result>()
+        if (dlFiles.isNotEmpty() || dlApps.isNotEmpty()) out += Result(false, "", custom = { downloadsCard() })
+        val rec = Prefs.list(c, Prefs.K_RECENT)
+        if (rec.isNotEmpty()) {
+            out += Result(true, "Recent")
+            for (q in rec.take(4)) out += Result(false, q, custom = { recentRow(q) })
+        }
+        if (apps.isNotEmpty()) { out += Result(true, "Apps"); out += Result(false, "", custom = { appsBlock() }) }
+        return out
+    }
+
+    private fun recentRow(q: String): View {
+        val row = LinearLayout(c)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(c.dp(12), c.dp(10), c.dp(12), c.dp(10))
+        val ic = TextView(c); ic.text = "\u21BA"; ic.textSize = 18f; ic.alpha = 0.6f; ic.setTextColor(Colors.text(c))
+        row.addView(ic, LinearLayout.LayoutParams(c.dp(28), WRAP))
+        val t = TextView(c); t.text = q; t.textSize = 15f; t.maxLines = 1
+        t.ellipsize = android.text.TextUtils.TruncateAt.END; t.setTextColor(Colors.text(c))
+        row.addView(t, LinearLayout.LayoutParams(0, WRAP, 1f).also { it.marginStart = c.dp(10) })
+        row.setOnClickListener { search.setText(q); search.setSelection(q.length) }
+        row.setOnLongClickListener {
+            Prefs.setList(c, Prefs.K_RECENT, Prefs.list(c, Prefs.K_RECENT).filter { it != q }, false)
+            refreshHome(); true
+        }
+        return row
+    }
+
+    /** Apps in two rows of four, plus a "More apps" link when there are more. */
+    private fun appsBlock(): View {
+        val col = LinearLayout(c)
+        col.orientation = LinearLayout.VERTICAL
+        val shown = apps.take(8)
+        for (r in 0 until 2) {
+            if (r * 4 >= shown.size) break
+            val row = LinearLayout(c)
+            row.orientation = LinearLayout.HORIZONTAL
+            for (i in 0 until 4) {
+                val idx = r * 4 + i
+                if (idx < shown.size) {
+                    val a = shown[idx]
+                    val cell = AppCell(c)
+                    cell.bind(a)
+                    cell.setOnClickListener { remember(); launch(a) }
+                    cell.setSecondaryClick { x, y -> showAppMenu(a, x, y, cell) }
+                    cell.setOnLongClickListener { v ->
+                        val loc = IntArray(2); v.getLocationOnScreen(loc)
+                        showAppMenu(a, loc[0] + v.width / 2, loc[1] + v.height / 2, v); true
+                    }
+                    row.addView(cell, LinearLayout.LayoutParams(0, WRAP, 1f))
+                } else row.addView(View(c), LinearLayout.LayoutParams(0, 1, 1f))
+            }
+            col.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+        }
+        if (apps.size > 8) {
+            val more = TextView(c)
+            more.text = UiText.text(c, "More apps")
+            more.textSize = 14f
+            more.gravity = Gravity.CENTER
+            more.setTextColor(Colors.accent(c))
+            more.setPadding(0, c.dp(10), 0, c.dp(10))
+            more.setOnClickListener { moreApps = true; render() }
+            col.addView(more, LinearLayout.LayoutParams(MATCH, WRAP))
+        }
+        return col
+    }
+
+    private fun downloadsCard(): View {
+        val files = if (dlExpanded) dlFiles else dlFiles.take(5)
+        val card = LinearLayout(c)
+        card.orientation = LinearLayout.VERTICAL
+        card.background = Colors.rounded(Colors.surfaceHigh(c), c.dp(24).toFloat())
+        card.setPadding(c.dp(14), c.dp(8), c.dp(14), c.dp(4))
+        UiText.applyDirection(card, c)
+
+        val head = LinearLayout(c)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        val title = TextView(c)
+        title.text = UiText.text(c, if (dlFiles.isNotEmpty()) "Files downloaded today" else "Apps installed today")
+        title.textSize = 16f
+        title.setTypeface(title.typeface, android.graphics.Typeface.BOLD)
+        title.setTextColor(Colors.text(c))
+        head.addView(title, LinearLayout.LayoutParams(0, WRAP, 1f))
+        val x = TextView(c)
+        x.text = "\u2715"
+        x.textSize = 18f
+        x.gravity = Gravity.CENTER
+        x.setTextColor(Colors.text(c))
+        x.setOnClickListener { Downloads.dismiss(c); dlFiles = emptyList(); dlApps = emptyList(); refreshHome() }
+        head.addView(x, LinearLayout.LayoutParams(c.dp(40), c.dp(40)))
+        card.addView(head, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        val pill = TextView(c)
+        pill.text = UiText.text(c, "Create shortcuts for all files")
+        pill.textSize = 14f
+        pill.gravity = Gravity.CENTER
+        pill.setTextColor(Colors.iconFg(c))
+        pill.background = Colors.rounded(Colors.iconBg(c), c.dp(20).toFloat())
+        pill.setPadding(c.dp(16), c.dp(8), c.dp(16), c.dp(8))
+        pill.setOnClickListener {
+            var ok = 0
+            for (e in dlFiles) if (Downloads.createShortcut(c, e.file)) ok++
+            c.toast(UiText.text(c, if (ok > 0) "Shortcuts created on Desktop" else "Could not create shortcut"))
+            if (ok > 0) { dlFiles = emptyList(); refreshHome() }
+        }
+        if (dlFiles.isNotEmpty()) card.addView(pill, LinearLayout.LayoutParams(WRAP, WRAP).also { it.topMargin = c.dp(4); it.bottomMargin = c.dp(6) })
+
+        // Files and today's new apps share one scroll area that is as tall as five file rows.
+        val inner = LinearLayout(c)
+        inner.orientation = LinearLayout.VERTICAL
+        val scroll = CappedScroll(c, if (dlExpanded) Int.MAX_VALUE else c.dp(52) * 5)
+        scroll.isVerticalScrollBarEnabled = false
+        scroll.addView(inner, ViewGroup.LayoutParams(MATCH, WRAP))
+        card.addView(scroll, LinearLayout.LayoutParams(MATCH, WRAP))
+
+        val ext = android.os.Environment.getExternalStorageDirectory().absolutePath
+        for (e in files) {
+            val f = e.file
+            val row = LinearLayout(c)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.setPadding(0, c.dp(8), 0, c.dp(8))
+            val iv = android.widget.ImageView(c)
+            Thumbs.bind(iv, f, c.dp(36))
+            row.addView(iv, LinearLayout.LayoutParams(c.dp(36), c.dp(36)).also { it.marginEnd = c.dp(12) })
+            val col = LinearLayout(c)
+            col.orientation = LinearLayout.VERTICAL
+            val n = TextView(c); n.text = f.name; n.textSize = 15f; n.maxLines = 1
+            n.ellipsize = android.text.TextUtils.TruncateAt.END; n.setTextColor(Colors.text(c))
+            col.addView(n)
+            val dir = (f.parent ?: "").removePrefix(ext).trimStart('/')
+            val sub = LinearLayout(c)
+            sub.orientation = LinearLayout.HORIZONTAL
+            val s = TextView(c); s.text = dir; s.textSize = 12f; s.alpha = 0.6f
+            s.maxLines = 1; s.ellipsize = android.text.TextUtils.TruncateAt.MIDDLE; s.setTextColor(Colors.text(c))
+            sub.addView(s, LinearLayout.LayoutParams(0, WRAP, 1f))
+            val tm = TextView(c); tm.text = " \u2022 " + Downloads.ago(c, e.time); tm.textSize = 12f; tm.alpha = 0.6f
+            tm.maxLines = 1; tm.setTextColor(Colors.text(c))
+            sub.addView(tm, LinearLayout.LayoutParams(WRAP, WRAP))
+            col.addView(sub, LinearLayout.LayoutParams(MATCH, WRAP))
+            row.addView(col, LinearLayout.LayoutParams(0, WRAP, 1f))
+            row.setOnHoverListener { v, ev ->
+                if (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_ENTER) emphasize(v, true, false)
+                else if (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_EXIT) emphasize(v, false, false)
+                false
+            }
+            row.setOnClickListener { Files.open(c, f); onClose() }
+            row.setOnLongClickListener { v ->
+                val loc = IntArray(2); v.getLocationOnScreen(loc)
+                PopupMenuX(c, this).also { it.spotlight = v }.show(loc[0], loc[1] + v.height, listOf(
+                    MenuItem("Open") { Files.open(c, f); onClose() },
+                    MenuItem("Create shortcut on Desktop") {
+                        if (Downloads.createShortcut(c, f)) {
+                            c.toast(UiText.text(c, "Shortcut created on Desktop"))
+                            dlFiles = dlFiles.filter { it.file != f }; refreshHome()
+                        } else c.toast(UiText.text(c, "Could not create shortcut"))
+                    }
+                ))
+                true
+            }
+            inner.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+        }
+
+        if (dlApps.isNotEmpty()) {
+            if (dlFiles.isNotEmpty()) {
+                val h = TextView(c)
+                h.text = UiText.text(c, "Apps installed today")
+                h.textSize = 12f
+                h.setTextColor(Colors.accent(c))
+                h.setPadding(0, c.dp(10), 0, c.dp(2))
+                inner.addView(h)
+            }
+            val shown = if (dlExpanded) dlApps else dlApps.take(8)
+            for (r in 0 until (shown.size + 3) / 4) {
+                val row = LinearLayout(c)
+                row.orientation = LinearLayout.HORIZONTAL
+                for (i in 0 until 4) {
+                    val idx = r * 4 + i
+                    if (idx < shown.size) {
+                        val a = shown[idx]
+                        val cell = AppCell(c)
+                        cell.bind(a)
+                        cell.setOnClickListener { launch(a) }
+                        cell.setOnLongClickListener { v ->
+                            val loc = IntArray(2); v.getLocationOnScreen(loc)
+                            showAppMenu(a, loc[0] + v.width / 2, loc[1] + v.height / 2, v); true
+                        }
+                        row.addView(cell, LinearLayout.LayoutParams(0, WRAP, 1f))
+                    } else row.addView(View(c), LinearLayout.LayoutParams(0, 1, 1f))
+                }
+                inner.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+            }
+        }
+
+        if (dlFiles.size > 5 || dlApps.size > 8) {
+            val all = TextView(c)
+            all.text = UiText.text(c, if (dlExpanded) "Show less" else "All downloads")
+            all.textSize = 14f
+            all.gravity = Gravity.CENTER
+            all.setTextColor(Colors.accent(c))
+            all.setPadding(0, c.dp(10), 0, c.dp(10))
+            all.setOnClickListener { dlExpanded = !dlExpanded; refreshHome() }
+            card.addView(all, LinearLayout.LayoutParams(MATCH, WRAP))
+        } else card.setPadding(c.dp(14), c.dp(8), c.dp(14), c.dp(8))
+
+        val wrap = FrameLayout(c)
+        wrap.setPadding(0, c.dp(4), 0, c.dp(8))
+        wrap.addView(card, FrameLayout.LayoutParams(MATCH, WRAP))
+        return wrap
+    }
+
     private fun buildResults(q: String): List<Result> {
         val ql = q.lowercase()
         val out = ArrayList<Result>()
+        if (apps.isNotEmpty()) { out += Result(true, "Apps"); out += Result(false, "", custom = { appsBlock() }) }
 
         val setHits = SETTINGS.filter { it.first.lowercase().contains(ql) }
         if (setHits.isNotEmpty()) {
@@ -462,10 +840,59 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         return out
     }
 
+    /** ScrollView limited to a maximum height; it keeps touches from the outer list while it can still scroll. */
+    private class CappedScroll(ctx: Context, private val maxH: Int) : android.widget.ScrollView(ctx) {
+        private var downY = 0f
+        override fun onMeasure(w: Int, h: Int) {
+            super.onMeasure(w, if (maxH == Int.MAX_VALUE) h else MeasureSpec.makeMeasureSpec(maxH, MeasureSpec.AT_MOST))
+        }
+        override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+            when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> { downY = ev.y; parent?.requestDisallowInterceptTouchEvent(canScrollVertically(1) || canScrollVertically(-1)) }
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    val dy = ev.y - downY
+                    val can = if (dy > 0) canScrollVertically(-1) else canScrollVertically(1)
+                    parent?.requestDisallowInterceptTouchEvent(can)
+                }
+            }
+            return super.dispatchTouchEvent(ev)
+        }
+    }
+
+    /** Pointer hover / keyboard selection: accent outline around the item and, for icons, a slight lift. */
+    private fun emphasize(v: View, on: Boolean, lift: Boolean) {
+        if (lift) v.animate().scaleX(if (on) 1.1f else 1f).scaleY(if (on) 1.1f else 1f).setDuration(120).start()
+        v.foreground = if (on) android.graphics.drawable.GradientDrawable().also {
+            it.setColor(0)
+            it.cornerRadius = c.dp(14).toFloat()
+            it.setStroke(c.dp(2), Colors.accent(c))
+        } else null
+    }
+
+    private inner class EmphRow(ctx: Context, private val lift: Boolean) : LinearLayout(ctx) {
+        private var hover = false
+        var plain = false
+        init {
+            setOnHoverListener { _, ev ->
+                if (plain) return@setOnHoverListener false
+                if (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_ENTER) { hover = true; emphasize(this, true, lift) }
+                else if (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_EXIT) { hover = false; emphasize(this, isSelected, lift) }
+                false
+            }
+        }
+        override fun setSelected(selected: Boolean) { super.setSelected(selected); emphasize(this, selected || hover, lift) }
+    }
+
     private inner class AppCell(ctx: Context) : LinearLayout(ctx) {
+        private var hover = false
         private val icon = BadgedIcon(ctx)
         private val label = TextView(ctx)
         init {
+            setOnHoverListener { _, ev ->
+                if (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_ENTER) { hover = true; emphasize(this, true, true) }
+                else if (ev.actionMasked == android.view.MotionEvent.ACTION_HOVER_EXIT) { hover = false; emphasize(this, isSelected, true) }
+                false
+            }
             orientation = VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(0, ctx.dp(4), 0, ctx.dp(4))
@@ -477,6 +904,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             label.setTextColor(Colors.text(ctx))
             addView(label, LayoutParams(MATCH, WRAP))
         }
+        override fun setSelected(selected: Boolean) { super.setSelected(selected); emphasize(this, selected || hover, true) }
         fun bind(a: AppInfo) {
             icon.setImageDrawable(Icons.app(context, a.comp, themed))
             icon.dot = dots && NotifState.has(a.pkg)

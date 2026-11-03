@@ -8,7 +8,11 @@ import android.view.MotionEvent
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.PopupWindow
+import android.widget.ScrollView
 import android.widget.TextView
+
+/** Bottom area (dock or taskbar plus navigation bar) that popup menus must stay above. Set by the launcher. */
+object MenuArea { @Volatile var bottomReserve = 0 }
 
 class MenuItem(
     val label: String,
@@ -21,23 +25,81 @@ class MenuItem(
 
 /** Context menu with sub menus, drawn as popup windows (works inside overlay windows too). */
 class PopupMenuX(private val ctx: Context, private val anchor: View) {
+    companion object {
+        private val active = java.util.Collections.newSetFromMap(java.util.WeakHashMap<PopupMenuX, Boolean>())
+        /** True while any menu of the launcher is open. */
+        fun anyOpen(): Boolean {
+            // only menus whose window is really on screen count; a stale entry must never block swipes and shortcuts
+            val it = active.iterator()
+            var open = false
+            while (it.hasNext()) {
+                val m = it.next()
+                if (m.stack.firstOrNull()?.isShowing == true) open = true else it.remove()
+            }
+            return open
+        }
+    }
     private val stack = ArrayList<PopupWindow>()
+    /** Called when the whole menu has closed (item chosen, tapped outside, back). */
+    var onClosed: (() -> Unit)? = null
+    private var blurred: View? = null
+    /** The item this menu belongs to: shown sharp, outlined and slightly raised above the blurred screen while the menu is open. */
+    var spotlight: View? = null
+    private var spotWin: PopupWindow? = null
 
-    fun show(x: Int, y: Int, items: List<MenuItem>, above: Boolean = false) =
+    private fun showSpotlight() {
+        val v = spotlight ?: return
+        val w = v.width; val h = v.height
+        if (w <= 0 || h <= 0) return
+        try {
+            val m = ctx.dp(10)
+            val bmp = android.graphics.Bitmap.createBitmap(w + 2 * m, h + 2 * m, android.graphics.Bitmap.Config.ARGB_8888)
+            val cv = android.graphics.Canvas(bmp)
+            val fg = v.foreground
+            v.foreground = null
+            cv.translate(m.toFloat(), m.toFloat())
+            cv.scale(1.1f, 1.1f, w / 2f, h / 2f)
+            try { v.draw(cv) } finally { v.foreground = fg }
+            val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+            p.style = android.graphics.Paint.Style.STROKE
+            p.strokeWidth = ctx.dp(2).toFloat()
+            p.color = Colors.accent(ctx)
+            cv.drawRoundRect(android.graphics.RectF(0f, 0f, w.toFloat(), h.toFloat()), ctx.dp(14).toFloat(), ctx.dp(14).toFloat(), p)
+            val iv = android.widget.ImageView(ctx)
+            iv.setImageBitmap(bmp)
+            val pw = PopupWindow(iv, w + 2 * m, h + 2 * m, false)
+            pw.setBackgroundDrawable(ColorDrawable(0))
+            pw.isTouchable = false
+            pw.isClippingEnabled = false
+            val loc = IntArray(2); v.getLocationOnScreen(loc)
+            val a = IntArray(2); val b = IntArray(2)
+            anchor.getLocationOnScreen(a); anchor.getLocationInWindow(b)
+            pw.showAtLocation(anchor, Gravity.NO_GRAVITY, loc[0] - m - (a[0] - b[0]), loc[1] - m - (a[1] - b[1]))
+            spotWin = pw
+        } catch (_: Throwable) { spotWin = null }
+    }
+
+    fun show(x: Int, y: Int, items: List<MenuItem>, above: Boolean = false) {
+        active.add(this)
+        showSpotlight()
         level(x, y, items, 0, above, null)
+        if (stack.isEmpty()) active.remove(this)
+    }
 
     fun dismiss() = closeFrom(0)
 
     private fun closeFrom(n: Int) {
         while (stack.size > n) stack.removeAt(stack.size - 1).dismiss()
+        if (n == 0) { try { spotWin?.dismiss() } catch (_: Throwable) {}; spotWin = null; active.remove(this); blurred?.let { Blur.behind(ctx, it, false) }; blurred = null; onClosed?.invoke() }
     }
 
     private fun level(x: Int, y: Int, items: List<MenuItem>, lvl: Int, above: Boolean, flipX: Int?) {
-        closeFrom(lvl)
+        // only close what is really open: closing level 0 of an empty menu would remove the spotlight and fire onClosed
+        if (stack.size > lvl) closeFrom(lvl)
         val col = LinearLayout(ctx)
         UiText.applyDirection(col, ctx)
         col.orientation = LinearLayout.VERTICAL
-        col.background = Colors.rounded(Colors.surface(ctx), ctx.dp(12).toFloat())
+        col.background = Colors.panel(ctx, Colors.surface(ctx), ctx.dp(12).toFloat())
         col.setPadding(ctx.dp(4), ctx.dp(6), ctx.dp(4), ctx.dp(6))
         col.minimumWidth = ctx.dp(190)
 
@@ -81,16 +143,24 @@ class PopupMenuX(private val ctx: Context, private val anchor: View) {
 
         col.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED)
         val w = col.measuredWidth
-        val h = col.measuredHeight
+        var h = col.measuredHeight
         val dm = ctx.resources.displayMetrics
+        val ins = Insets.safe(ctx)
+        val maxR = dm.widthPixels - ins.right
+        val maxB = dm.heightPixels - maxOf(ins.bottom, MenuArea.bottomReserve)
         var px = x
-        if (px + w > dm.widthPixels) px = if (flipX != null) flipX - w else dm.widthPixels - w
-        if (px < 0) px = 0
+        if (px + w > maxR) px = if (flipX != null) flipX - w else maxR - w
+        if (px < ins.left) px = ins.left
+        // Taller than the free area (between status bar and dock/taskbar): the menu scrolls instead of overflowing.
+        val avail = (dm.heightPixels - maxOf(ins.bottom, MenuArea.bottomReserve)) - ins.top
+        val scroll = h > avail
+        if (scroll) h = avail
         var py = if (above) y - h else y
-        if (py + h > dm.heightPixels) py = dm.heightPixels - h
-        if (py < 0) py = 0
+        if (py + h > maxB) py = maxB - h
+        if (py < ins.top) py = ins.top
 
-        val pw = PopupWindow(col, WRAP, WRAP, lvl == 0)
+        val content: View = if (scroll) ScrollView(ctx).also { it.isVerticalScrollBarEnabled = false; it.addView(col) } else col
+        val pw = if (scroll) PopupWindow(content, w, h, lvl == 0) else PopupWindow(content, WRAP, WRAP, lvl == 0)
         pw.setBackgroundDrawable(ColorDrawable(0))
         pw.elevation = ctx.dp(8).toFloat()
         pw.isClippingEnabled = false
@@ -104,6 +174,7 @@ class PopupMenuX(private val ctx: Context, private val anchor: View) {
             anchor.getLocationOnScreen(a); anchor.getLocationInWindow(b)
             pw.showAtLocation(anchor, Gravity.NO_GRAVITY, px - (a[0] - b[0]), py - (a[1] - b[1]))
             Blur.popup(ctx, pw)
+            if (lvl == 0 && blurred == null && (ctx is android.app.Activity || anchor.rootView is DrawerView)) { blurred = anchor.rootView; Blur.behind(ctx, blurred, true) }
         } catch (e: Exception) {
             stack.remove(pw)
         }

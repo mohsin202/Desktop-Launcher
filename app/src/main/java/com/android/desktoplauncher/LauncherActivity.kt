@@ -31,10 +31,15 @@ import android.text.TextWatcher
 class LauncherActivity : Activity() {
     companion object {
         const val ACTION_TOGGLE_DRAWER = "com.android.desktoplauncher.TOGGLE_DRAWER"
+        const val ACTION_CATEGORIES = "com.android.desktoplauncher.CATEGORIES"
         private const val REQ_BIND = 11
         private const val REQ_CONFIG = 12
         private const val HOST_ID = 1024
+        private var live: java.lang.ref.WeakReference<LauncherActivity>? = null
+        /** The taskbar's drawer is its own window: it asks the launcher screen behind it to blur. */
+        fun blurFromOverlay(on: Boolean) { live?.get()?.let { it.extBlur = on; it.syncBlur() } }
     }
+    private var extBlur = false
 
     private lateinit var root: FrameLayout
     private lateinit var desktop: DesktopView
@@ -43,9 +48,14 @@ class LauncherActivity : Activity() {
     lateinit var awm: AppWidgetManager
     private var drawer: DrawerView? = null
     private var dock: TaskbarView? = null
+    private var catBar: CatBar? = null
+    private var catMenu: CatMenu? = null
+    private var catMargin = 0
     private var dockH = 0
     private var padTop = 0
     private var padBottom = 0
+    private var padLeft = 0
+    private var padRight = 0
     private var pendingId = -1
     private var pendingInfo: AppWidgetProviderInfo? = null
     private var pendX = 300
@@ -64,6 +74,8 @@ class LauncherActivity : Activity() {
         root = FrameLayout(this)
         desktop = DesktopView(this)
         root.addView(desktop, FrameLayout.LayoutParams(MATCH, MATCH))
+        catBar = CatBar(this, desktop)
+        root.addView(catBar, FrameLayout.LayoutParams(WRAP, dp(24), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
         banner = TextView(this)
         banner.setTextColor(Color.WHITE)
         banner.textSize = 13f
@@ -76,16 +88,20 @@ class LauncherActivity : Activity() {
         UiText.applyDirection(root, this)
         setContentView(root)
         root.setOnApplyWindowInsetsListener { _, ins ->
-            val bars = ins.getInsets(WindowInsets.Type.systemBars())
+            val bars = Insets.of(ins)
             padTop = bars.top
             padBottom = bars.bottom
+            padLeft = bars.left
+            padRight = bars.right
             applyPadding()
             ins
         }
         Bus.add(busListener)
+        live = java.lang.ref.WeakReference(this)
     }
 
     override fun onDestroy() {
+        if (live?.get() === this) live = null
         Bus.remove(busListener)
         super.onDestroy()
     }
@@ -128,16 +144,25 @@ class LauncherActivity : Activity() {
 
     private fun applyPadding() {
         val phone = !Modes.tablet(this)
+        catMargin = if (phone && barOn()) padBottom + dp(8) + dockH + dp(4) else padBottom + dp(8)
+        catBar?.visibility = if (phone) android.view.View.VISIBLE else android.view.View.GONE
+        catBar?.let {
+            val lp = it.layoutParams as FrameLayout.LayoutParams
+            lp.bottomMargin = catMargin
+            it.layoutParams = lp
+        }
         val bottom = when {
-            phone && barOn() -> padBottom + dockH + dp(16)
+            phone && barOn() -> catMargin + dp(32)
+            phone -> catMargin + dp(32)
             !phone && barOn() && TaskbarService.instance != null -> maxOf(padBottom, dp(Prefs.tbDp(this)))
             else -> padBottom
         }
-        desktop.setPadding(0, padTop, 0, bottom)
+        MenuArea.bottomReserve = bottom
+        desktop.setPadding(padLeft, padTop, padRight, bottom)
         dock?.let {
             val lp = it.layoutParams as FrameLayout.LayoutParams
             lp.height = dockH
-            lp.leftMargin = dp(16); lp.rightMargin = dp(16); lp.bottomMargin = padBottom + dp(8)
+            lp.leftMargin = padLeft + dp(16); lp.rightMargin = padRight + dp(16); lp.bottomMargin = padBottom + dp(8)
             it.layoutParams = lp
         }
     }
@@ -156,6 +181,7 @@ class LauncherActivity : Activity() {
         super.onResume()
         applyMode()
         updateBanner()
+        desktop.refreshTrashIcon(true)
     }
 
     private fun updateBanner() {
@@ -180,7 +206,8 @@ class LauncherActivity : Activity() {
         super.onNewIntent(intent)
         setIntent(intent)
         if (intent.action == ACTION_TOGGLE_DRAWER) toggleDrawer()
-        else { closeDrawer(); TaskbarService.instance?.closeDrawer(); desktop.clearSelection() }
+        else if (intent.action == ACTION_CATEGORIES) { closeWidgetSheet(); closeDrawer(); TaskbarService.instance?.closeDrawer(); openCats() }
+        else { closeWidgetSheet(); closeDrawer(); closeCats(); TaskbarService.instance?.closeDrawer(); desktop.clearSelection(); desktop.closeFolder(); desktop.goHome() }
     }
 
     override fun onConfigurationChanged(c: Configuration) {
@@ -191,7 +218,29 @@ class LauncherActivity : Activity() {
     }
 
     @Deprecated("Deprecated in Java")
-    override fun onBackPressed() { if (drawer != null) closeDrawer() }
+    override fun onBackPressed() { if (catMenu != null) { if (catMenu?.back() != true) closeCats() } else if (sheet != null) closeWidgetSheet() else if (drawer != null) closeDrawer() else desktop.closeFolder() }
+
+    /** The desktop (and the page button) are blurred while the drawer, the screens page or the widget sheet is open. */
+    /** Page button above the dock, blurred while a folder is open. */
+    fun blurChrome(on: Boolean) { Blur.behind(this, catBar, on || drawer != null || catMenu != null || sheet != null || extBlur) }
+
+    /** Blurs the wallpaper behind the launcher window (everything behind it, but not the dock, which is part of this window). */
+    fun wallBlur(on: Boolean) {
+        if (android.os.Build.VERSION.SDK_INT < 31) return
+        try {
+            val want = on && (Prefs.bool(this, Prefs.K_BLUR, false) || Prefs.bool(this, Prefs.K_GLASS, false))
+            val lp = window.attributes
+            if (want) { lp.blurBehindRadius = dp(26); window.addFlags(android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND) }
+            else { lp.blurBehindRadius = 0; window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND) }
+            window.attributes = lp
+        } catch (_: Throwable) {}
+    }
+
+    private fun syncBlur() {
+        val on = drawer != null || catMenu != null || sheet != null || extBlur
+        Blur.behind(this, desktop, on)
+        Blur.behind(this, catBar, on)
+    }
 
     fun toggleDrawer() {
         val svc = TaskbarService.instance
@@ -202,7 +251,25 @@ class LauncherActivity : Activity() {
             root.addView(d, FrameLayout.LayoutParams(MATCH, MATCH))
             drawer = d
             d.post { d.onShown() }
+            syncBlur()
         }
+    }
+
+    fun openCats() {
+        if (catMenu != null) return
+        closeDrawer()
+        val phone = !Modes.tablet(this)
+        val gap = if (phone) catMargin + dp(24) + dp(8) else MenuArea.bottomReserve + dp(8)
+        val m = CatMenu(this, desktop, gap) { closeCats() }
+        root.addView(m, FrameLayout.LayoutParams(MATCH, MATCH))
+        catMenu = m
+        syncBlur()
+    }
+
+    fun closeCats() {
+        catMenu?.let { root.removeView(it) }
+        catMenu = null
+        syncBlur()
     }
 
     fun desktopOpenFile(file: java.io.File) { desktop.openFile(file) }
@@ -210,165 +277,62 @@ class LauncherActivity : Activity() {
     fun closeDrawer() {
         drawer?.let { root.removeView(it) }
         drawer = null
+        syncBlur()
         TaskbarService.instance?.closeDrawer()
     }
 
     // ------------------------------------------------------------ widgets
 
+    private var sheet: WidgetSheet? = null
+
     fun pickWidget(x: Int, y: Int) {
-        pendX = x; pendY = y
+        closeWidgetSheet()
         val pm = packageManager
-        val all = try { awm.installedProviders.sortedBy { it.loadLabel(pm).toString().lowercase() } }
+        val providers = try { awm.installedProviders.sortedBy { it.loadLabel(pm).toString().lowercase() } }
                   catch (_: Exception) { emptyList() }
-        if (all.isEmpty()) { toast("No widgets available"); return }
-
-        var selected = all.first()
-        val dialog = Dialog(this)
-        val outer = FrameLayout(this).apply {
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            setBackgroundColor(Color.TRANSPARENT)
+        val dens = resources.displayMetrics.density
+        val ownName = try { pm.getApplicationLabel(applicationInfo).toString() } catch (_: Exception) { "Desktop Launcher" }
+        val ownIcon = try { pm.getApplicationIcon(packageName) } catch (_: Exception) { pm.defaultActivityIcon }
+        // Built-in launcher widgets come first, then the widgets of installed apps.
+        val all = ArrayList<WidgetItem>()
+        for (d in InternalWidgets.all) {
+            all += WidgetItem(UiText.text(this, d.title), packageName, ownName, ownIcon, d.minWdp, d.minHdp,
+                { InternalWidgets.preview(this, d.type) }) { px, py -> desktop.addInternal(d.type, px, py) }
         }
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = Colors.rounded(Colors.surfaceSolid(this@LauncherActivity), dp(30).toFloat())
-            setPadding(dp(18), dp(18), dp(18), dp(12))
-        }
-        outer.addView(panel, FrameLayout.LayoutParams(MATCH, MATCH))
-
-        val search = EditText(this).apply {
-            hint = UiText.text(this@LauncherActivity, "Search")
-            setSingleLine(true)
-            inputType = InputType.TYPE_CLASS_TEXT
-            textSize = 16f
-            setTextColor(Colors.text(this@LauncherActivity))
-            setHintTextColor(Colors.text(this@LauncherActivity) and 0x88FFFFFF.toInt())
-            background = Colors.rounded(Colors.surfaceHigh(this@LauncherActivity), dp(28).toFloat())
-            setPadding(dp(20), dp(8), dp(20), dp(8))
-        }
-        panel.addView(search, LinearLayout.LayoutParams(MATCH, dp(52)))
-
-        val selectedTitle = TextView(this).apply {
-            textSize = 20f
-            gravity = Gravity.CENTER
-            setTextColor(Colors.text(this@LauncherActivity))
-            setPadding(dp(4), dp(12), dp(4), dp(2))
-        }
-        panel.addView(selectedTitle, LinearLayout.LayoutParams(MATCH, WRAP))
-        val selectedApp = TextView(this).apply {
-            textSize = 13f
-            gravity = Gravity.CENTER
-            alpha = 0.72f
-            setTextColor(Colors.text(this@LauncherActivity))
-        }
-        panel.addView(selectedApp, LinearLayout.LayoutParams(MATCH, WRAP))
-        val preview = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setPadding(dp(12), dp(8), dp(12), dp(8)) }
-        panel.addView(preview, LinearLayout.LayoutParams(MATCH, dp(150)))
-        val sizeLabel = TextView(this).apply {
-            gravity = Gravity.CENTER
-            textSize = 13f
-            alpha = 0.7f
-            setTextColor(Colors.text(this@LauncherActivity))
-            setPadding(0, 0, 0, dp(8))
-        }
-        panel.addView(sizeLabel, LinearLayout.LayoutParams(MATCH, WRAP))
-        val include = Button(this).apply {
-            text = UiText.text(this@LauncherActivity, "Include")
-            isAllCaps = false
-            background = Colors.rounded(Colors.taskbar(this@LauncherActivity), dp(30).toFloat())
-            setTextColor(Colors.text(this@LauncherActivity))
-        }
-        panel.addView(include, LinearLayout.LayoutParams(WRAP, dp(48)).also { it.gravity = Gravity.CENTER; it.bottomMargin = dp(10) })
-        val divider = android.view.View(this).apply { setBackgroundColor(Colors.text(this@LauncherActivity) and 0x22000000) }
-        panel.addView(divider, LinearLayout.LayoutParams(MATCH, dp(1)))
-        val scroll = ScrollView(this).apply { isFillViewport = true; clipToPadding = false }
-        val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        scroll.addView(rows, FrameLayout.LayoutParams(MATCH, WRAP))
-        panel.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
-        val cancel = TextView(this).apply {
-            text = UiText.text(this@LauncherActivity, "Cancel")
-            textSize = 15f
-            setTextColor(Colors.accent(this@LauncherActivity))
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(10), dp(8), dp(4))
-            setOnClickListener { dialog.dismiss() }
-        }
-        panel.addView(cancel, LinearLayout.LayoutParams(MATCH, dp(42)))
-
-        fun appName(info: AppWidgetProviderInfo): String = try {
-            pm.getApplicationLabel(pm.getApplicationInfo(info.provider.packageName, 0)).toString()
-        } catch (_: Exception) { info.provider.packageName }
-
-        fun refreshSelected() {
-            selectedTitle.text = try { selected.loadLabel(pm).toString() } catch (_: Exception) { selected.provider.className }
-            selectedApp.text = appName(selected)
-            sizeLabel.text = "${maxOf(1, selected.minWidth)} × ${maxOf(1, selected.minHeight)} dp"
-            val drawable = try { selected.loadPreviewImage(this, resources.displayMetrics.densityDpi) } catch (_: Exception) { null }
-            preview.setImageDrawable(drawable ?: try { pm.getApplicationIcon(selected.provider.packageName) } catch (_: Exception) { pm.defaultActivityIcon })
-        }
-
-        fun renderRows(query: String) {
-            rows.removeAllViews()
-            val filtered = all.filter { info ->
-                val label = try { info.loadLabel(pm).toString() } catch (_: Exception) { "" }
-                label.contains(query, true) || appName(info).contains(query, true)
-            }
-            for (info in filtered) {
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(dp(8), dp(8), dp(8), dp(8))
-                    background = if (info == selected) Colors.rounded(Colors.surfaceHigh(this@LauncherActivity), dp(14).toFloat()) else ColorDrawable(Color.TRANSPARENT)
-                    isClickable = true
-                    isFocusable = true
-                }
-                val icon = ImageView(this).apply {
-                    scaleType = ImageView.ScaleType.FIT_CENTER
-                    setImageDrawable(try { pm.getApplicationIcon(info.provider.packageName) } catch (_: Exception) { pm.defaultActivityIcon })
-                }
-                row.addView(icon, LinearLayout.LayoutParams(dp(42), dp(42)).also { it.marginEnd = dp(12) })
-                val labels = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-                val title = TextView(this).apply {
-                    text = try { info.loadLabel(pm).toString() } catch (_: Exception) { info.provider.className }
-                    textSize = 16f
-                    maxLines = 1
-                    ellipsize = android.text.TextUtils.TruncateAt.END
-                    setTextColor(Colors.text(this@LauncherActivity))
-                }
-                val subtitle = TextView(this).apply {
-                    text = appName(info)
-                    textSize = 12f
-                    alpha = 0.7f
-                    maxLines = 1
-                    ellipsize = android.text.TextUtils.TruncateAt.END
-                    setTextColor(Colors.text(this@LauncherActivity))
-                }
-                labels.addView(title); labels.addView(subtitle)
-                row.addView(labels, LinearLayout.LayoutParams(0, WRAP, 1f))
-                row.setOnClickListener { selected = info; refreshSelected(); renderRows(search.text?.toString() ?: "") }
-                rows.addView(row, LinearLayout.LayoutParams(MATCH, WRAP).also { it.bottomMargin = dp(3) })
-            }
-            if (filtered.isEmpty()) {
-                rows.addView(TextView(this).apply {
-                    text = UiText.text(this@LauncherActivity, "No widgets found")
-                    setTextColor(Colors.text(this@LauncherActivity)); setPadding(dp(12), dp(18), dp(12), dp(18))
-                })
+        for (info in providers) {
+            all += WidgetItem(try { info.loadLabel(pm).toString() } catch (_: Exception) { info.provider.className },
+                info.provider.packageName,
+                try { pm.getApplicationLabel(pm.getApplicationInfo(info.provider.packageName, 0)).toString() } catch (_: Exception) { info.provider.packageName },
+                try { pm.getApplicationIcon(info.provider.packageName) } catch (_: Exception) { pm.defaultActivityIcon },
+                (maxOf(info.minWidth, 1) / dens).toInt(), (maxOf(info.minHeight, 1) / dens).toInt(),
+                { try { info.loadPreviewImage(this, resources.displayMetrics.densityDpi) } catch (_: Exception) { null } }) { px, py ->
+                pendX = px; pendY = py
+                startAdd(info)
             }
         }
+        val bottom = if (!Modes.tablet(this) && barOn()) padBottom + dockH + dp(16)
+            else if (Modes.tablet(this) && barOn() && TaskbarService.instance != null) maxOf(padBottom, dp(Prefs.tbDp(this))) else padBottom
+        val sh = WidgetSheet(this, all, padTop, bottom, { w, h -> desktop.spansFor(w, h) }) { closeWidgetSheet() }
+        root.addView(sh, FrameLayout.LayoutParams(MATCH, MATCH))
+        sheet = sh
+        syncBlur()
+    }
 
-        include.setOnClickListener { dialog.dismiss(); startAdd(selected) }
-        search.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { renderRows(s?.toString() ?: "") }
-            override fun afterTextChanged(s: Editable?) {}
-        })
-        refreshSelected()
-        renderRows("")
-        UiText.applyDirection(panel, this)
-        dialog.setContentView(outer)
-        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-        dialog.show()
-        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-        dialog.window?.setLayout(android.view.WindowManager.LayoutParams.MATCH_PARENT, android.view.WindowManager.LayoutParams.MATCH_PARENT)
+    fun closeWidgetSheet() {
+        sheet?.let { root.removeView(it) }
+        sheet = null
+        syncBlur()
+    }
+
+    /** The desktop reports the end of a widget drag: bring the sheet back if nothing was dropped. */
+    fun onWidgetDragEnded(dropped: Boolean) {
+        if (dropped) closeWidgetSheet() else sheet?.restoreAfterDrag()
+    }
+
+    /** Search bar widget: opens the app drawer with the search field focused. */
+    fun openSearchFromWidget() {
+        val svc = TaskbarService.instance
+        if (svc != null && Modes.tablet(this) && barOn()) svc.openSearch() else dockHost.openSearch()
     }
 
     private fun startAdd(info: AppWidgetProviderInfo) {
@@ -416,15 +380,17 @@ class LauncherActivity : Activity() {
 
         override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
             if (e1 == null || Modes.tablet(this@LauncherActivity)) return false
+            val overWidget = desktop.widgetAtRaw(e1.rawX, e1.rawY)
             val dy = e1.y - e2.y
-            val verticalSwipe = Math.abs(dy) > dp(90) && Math.abs(vy) > 900f && Math.abs(vy) > Math.abs(vx)
-            if (!verticalSwipe) return false
-
-            // Swipe up on the desktop opens the app drawer.
-            if (drawer == null && dy > 0 && vy < -900f) {
+            // Swipe up on the desktop opens the app drawer: a short, light flick anywhere is enough, but only while the
+            // plain home screen is showing (not with a menu, folder, widget sheet or screens page open).
+            if (drawer == null && !overWidget && dy > dp(40) && vy < -450f && Math.abs(vy) > Math.abs(vx)) {
+                if (catMenu != null || sheet != null || PopupMenuX.anyOpen() || !desktop.homeIdle()) return false
                 root.post { if (drawer == null) toggleDrawer() }
                 return true
             }
+            val verticalSwipe = Math.abs(dy) > dp(90) && Math.abs(vy) > 900f && Math.abs(vy) > Math.abs(vx)
+            if (!verticalSwipe) return false
             // Swipe down closes it only when the content was already at the top before the gesture.
             if (drawer != null && dy < 0 && vy > 900f && drawerWasAtTopOnTouchDown) {
                 root.post { if (drawer != null && drawer?.isContentAtTopForSwipeDismiss() == true) closeDrawer() }
@@ -434,7 +400,46 @@ class LauncherActivity : Activity() {
         }
     })
 
+    // Distance-based swipe: a short, slow swipe up (anywhere, except over a widget) opens the drawer, a short swipe down closes it.
+    private var upX = 0f; private var upY = 0f; private var upOk = false
+    private var upOpening = true; private var upTopAtDown = false
+    private fun trackUpSwipe(ev: MotionEvent) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                upX = ev.rawX; upY = ev.rawY
+                upOpening = drawer == null
+                upTopAtDown = drawer?.isContentAtTopForSwipeDismiss() == true
+                upOk = !Modes.tablet(this) && (if (upOpening) !desktop.widgetAtRaw(ev.rawX, ev.rawY) else upTopAtDown)
+            }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> upOk = false
+            MotionEvent.ACTION_MOVE -> {
+                // open as soon as the finger has travelled far enough, without waiting for it to lift
+                if (upOk && upOpening && drawer == null) {
+                    val dy = upY - ev.rawY; val dx = ev.rawX - upX
+                    if (dy > dp(56) && dy > Math.abs(dx) * 1.5f) {
+                        upOk = false
+                        if (catMenu != null || sheet != null || PopupMenuX.anyOpen() || !desktop.homeIdle()) return
+                        root.post { if (drawer == null) toggleDrawer() }
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!upOk) return
+                upOk = false
+                val dy = upY - ev.rawY; val dx = ev.rawX - upX
+                if (Math.abs(dy) < dp(40) || Math.abs(dy) < Math.abs(dx) * 1.5f) return
+                if (upOpening && dy > 0 && drawer == null) {
+                    if (catMenu != null || sheet != null || PopupMenuX.anyOpen() || !desktop.homeIdle()) return
+                    root.post { if (drawer == null) toggleDrawer() }
+                } else if (!upOpening && dy < 0 && drawer != null) {
+                    root.post { if (drawer != null && drawer?.isContentAtTopForSwipeDismiss() == true) closeDrawer() }
+                }
+            }
+        }
+    }
+
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        trackUpSwipe(ev)
         if (::swipe.isInitialized) swipe.onTouchEvent(ev)
         return super.dispatchTouchEvent(ev)
     }
