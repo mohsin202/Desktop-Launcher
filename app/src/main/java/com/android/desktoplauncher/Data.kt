@@ -19,6 +19,7 @@ class App : Application() {
         super.onCreate()
         AppRepo.register(this)
         Thread { AppRepo.load(this) }.start()
+        if (Prefs.bool(this, Prefs.K_FREEFORM, false)) RootSh.probe()
     }
 }
 
@@ -91,24 +92,52 @@ object Clip {
     var files: List<File> = emptyList()
     var cut = false
 
+    /** Shared with the Desk Files app: label + "DESKTOPFILES\n(copy|cut)\n<path>..." as plain text. */
+    const val LABEL = "desktop-files"
+    const val MAGIC = "DESKTOPFILES"
+
     fun set(c: Context, f: List<File>, cut: Boolean) {
         files = f
         this.cut = cut
-        if (!cut && f.isNotEmpty()) {
-            try {
-                val cm = c.getSystemService(ClipboardManager::class.java)
-                val clip = ClipData.newUri(c.contentResolver, "files", Files.uri(f[0]))
-                for (i in 1 until f.size) clip.addItem(ClipData.Item(Files.uri(f[i])))
-                cm.setPrimaryClip(clip)
-            } catch (_: Exception) {}
-        }
+        if (f.isEmpty()) return
+        try {
+            val cm = c.getSystemService(ClipboardManager::class.java)
+            val text = MAGIC + "\n" + (if (cut) "cut" else "copy") + "\n" + f.joinToString("\n") { it.absolutePath }
+            cm.setPrimaryClip(ClipData.newPlainText(LABEL, text))
+            writeShared(text)
+        } catch (_: Exception) {}
+    }
+
+    // Some systems only let the app in front read the clipboard (or hide it from other apps). So the same text is also kept in a
+    // small file that both apps can read; it is valid for an hour and removed after a Cut has been pasted.
+    private val shareFile: File get() = File(android.os.Environment.getExternalStorageDirectory(), ".deskclip")
+    private const val SHARE_TTL = 60 * 60 * 1000L
+
+    private fun writeShared(text: String) { try { shareFile.writeText(text) } catch (_: Exception) {} }
+    private fun clearShared() { try { shareFile.delete() } catch (_: Exception) {} }
+    private fun sharedFileFresh(): Boolean = try {
+        val f = shareFile; f.exists() && System.currentTimeMillis() - f.lastModified() < SHARE_TTL
+    } catch (_: Exception) { false }
+
+    private fun sharedLabel(c: Context): Boolean = try {
+        c.getSystemService(ClipboardManager::class.java).primaryClipDescription?.label?.toString() == LABEL
+    } catch (_: Exception) { false } || sharedFileFresh()
+
+    /** The shared text: from the clipboard when it carries our label, otherwise from the file. */
+    private fun sharedText(c: Context): String? {
+        try {
+            val cm = c.getSystemService(ClipboardManager::class.java)
+            val clip = cm.primaryClip
+            if (clip != null && clip.description.label?.toString() == LABEL) clip.getItemAt(0).text?.toString()?.let { return it }
+        } catch (_: Exception) {}
+        return if (sharedFileFresh()) try { shareFile.readText() } catch (_: Exception) { null } else null
     }
 
     fun clear() { files = emptyList(); cut = false }
 
     /** True when something can be pasted. Does not read clip contents (avoids the clipboard toast). */
     fun hasAny(c: Context): Boolean {
-        if (files.isNotEmpty()) return true
+        if (files.isNotEmpty() || sharedLabel(c)) return true
         return try {
             val d = c.getSystemService(ClipboardManager::class.java).primaryClipDescription
             d != null && d.mimeTypeCount > 0 && !d.hasMimeType("text/*")
@@ -118,6 +147,26 @@ object Clip {
     /** Runs on a worker thread. Returns number of pasted items. */
     fun paste(c: Context, dest: File): Int {
         var n = 0
+        val cm0 = c.getSystemService(ClipboardManager::class.java)
+        if (sharedLabel(c)) {
+            val lines = sharedText(c)?.lines()
+            if (lines != null && lines.size >= 3 && lines[0] == MAGIC) {
+                val isCut = lines[1] == "cut"
+                for (p in lines.drop(2)) {
+                    if (p.isBlank()) continue
+                    val src = File(p)
+                    if (!src.exists()) continue
+                    if (src.isDirectory && dest.absolutePath.startsWith(src.absolutePath)) continue
+                    val target = Files.unique(dest, src.name)
+                    try {
+                        if (isCut) Files.move(src, target) else Files.copyRec(src, target)
+                        n++
+                    } catch (_: Exception) {}
+                }
+                if (isCut && n > 0) { clear(); clearShared(); try { cm0.clearPrimaryClip() } catch (_: Exception) {} }
+                return n
+            }
+        }
         if (files.isNotEmpty()) {
             for (src in files) {
                 if (!src.exists()) continue

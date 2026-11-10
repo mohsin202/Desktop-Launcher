@@ -55,6 +55,15 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                  /** 0 = normal; 1 / 2 = a vertical taskbar sits on the left / right edge and the panel hugs it. */
                  private val barSide: Int = 0, private val onClose: () -> Unit) : FrameLayout(c) {
     val search = EditText(c)
+    /** Set by the host: may a drag to the desktop start now (the desktop must be showing behind the drawer)? */
+    var canDrag: () -> Boolean = { true }
+    /** Called with true when a drag starts (the host should uncover the desktop) and false when it is over. */
+    var dragHook: ((Boolean) -> Unit)? = null
+    private var pend: DeskDrag.Payload? = null
+    private var pendIcon: android.graphics.drawable.Drawable? = null
+    private var downX = 0f
+    private var downY = 0f
+    private var dragging = false
     private val panel = LinearLayout(c)
     private val grid = GridView(c)
     private val list = ListView(c)
@@ -96,7 +105,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             val cell = (cv as? AppCell) ?: AppCell(c)
             val a = apps[p]
             cell.bind(a)
-            cell.setSecondaryClick { x, y -> showAppMenu(a, x, y, cell) }
+            cell.setSecondaryClick { x, y -> showAppMenu(a, x, y, cell, false) }
             return cell
         }
     }
@@ -197,6 +206,16 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         } else if (!centred) lp.marginStart = c.dp(8) + (if (Prefs.direction(c) == 2) si.right else si.left)
         lp.bottomMargin = bottomMargin
         addView(panel, lp)
+        // a tiny view that only exists to hear when a drag is over
+        val sink = View(c)
+        sink.setOnDragListener { _, ev ->
+            when (ev.action) {
+                android.view.DragEvent.ACTION_DRAG_STARTED -> false // must not accept: an accepting child would make the whole drawer a drop target
+                android.view.DragEvent.ACTION_DRAG_ENDED -> { dragEnded(ev.result); true }
+                else -> false
+            }
+        }
+        addView(sink, LayoutParams(1, 1))
 
         search.hint = UiText.text(c, "Search")
         search.setSingleLine()
@@ -214,6 +233,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         grid.numColumns = cols
         grid.adapter = gridAdapter
         grid.verticalSpacing = c.dp(6)
+        grid.horizontalSpacing = c.dp(8)
         grid.selector = android.graphics.drawable.ColorDrawable(0)
         grid.setOnItemClickListener { _, _, p, _ -> launch(apps[p]) }
         var lx = 0; var ly = 0
@@ -232,16 +252,14 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             if (r.header || r.custom != null) return@setOnItemLongClickListener true
             val loc = IntArray(2); v.getLocationOnScreen(loc)
             val items = ArrayList<MenuItem>()
-            items += MenuItem("Open") { r.action(); onClose() }
-            r.file?.let { f -> items += MenuItem("Create shortcut on Desktop") {
-                val dest = Files.unique(Files.root(c), f.name + ".desktoplink")
-                try {
-                    val content = "DESKTOP_SHORTCUT\n${f.absolutePath}"
-                    dest.writeText(content)
-                    c.toast("Shortcut created on Desktop")
-                } catch (_: Exception) { c.toast("Could not create shortcut") }
-            } }
-            PopupMenuX(c, this).also { it.spotlight = v }.show(loc[0], loc[1] + v.height, items)
+            val rf = r.file
+            if (rf != null) items += fileMenuItems(rf, { r.action(); onClose() }) { runSearch(search.text?.toString() ?: "") }
+            else items += MenuItem("Open") { r.action(); onClose() }
+            menu?.dismiss()
+            r.file?.let { f -> armDrag(DeskDrag.Payload(DeskDrag.FILE, f.absolutePath), Icons.file(f)) }
+            val pm = PopupMenuX(c, this).also { it.spotlight = v }
+            menu = pm
+            pm.show(loc[0], loc[1] + v.height, items)
             true
         }
         panel.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f).also { it.topMargin = c.dp(6) })
@@ -271,7 +289,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     }
 
     private fun hideKeyboardIfVisible(): Boolean {
-        val visible = try { rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true } catch (_: Exception) { false }
+        val visible = Compat.imeVisible(this)
         if (!visible && !search.hasFocus()) return false
         val imm = c.getSystemService(InputMethodManager::class.java)
         val token = search.windowToken
@@ -328,6 +346,28 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         return super.dispatchGenericMotionEvent(ev)
     }
 
+    private fun statusBarPx(): Int {
+        val id = c.resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id > 0) c.resources.getDimensionPixelSize(id) else 0
+    }
+
+    /** Tallest the panel may be: it stays below the status bar (a side bar's window already starts below it). */
+    private fun maxPanelH(total: Int): Int {
+        val lp = panel.layoutParams as LayoutParams
+        return total - lp.bottomMargin - c.dp(8) - (if (barSide == 0 && !wide) statusBarPx() else 0)
+    }
+
+    /** A height chosen in portrait can be taller than landscape allows: shrink it for this window only. */
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val total = MeasureSpec.getSize(heightMeasureSpec)
+        val lp = panel.layoutParams as? LayoutParams
+        if (lp != null && !wide && total > 0 && lp.height > 0) {
+            val max = maxOf(c.dp(200), maxPanelH(total))
+            if (lp.height > max) lp.height = max
+        }
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
+
     private fun resizeTouch(ev: android.view.MotionEvent): Boolean {
         val lp = panel.layoutParams as LayoutParams
         when (ev.actionMasked) {
@@ -349,7 +389,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                 val dy = ev.rawY - ry0
                 val factor = if (centredMode) 2 else 1
                 val w = (rw0 + (if (activeSide < 0) -dx else dx) * factor).toInt().coerceIn(c.dp(280), dm.widthPixels - c.dp(16))
-                val maxH = (if (height > 0) height else dm.heightPixels) - lp.bottomMargin - c.dp(8)
+                val maxH = maxPanelH(if (height > 0) height else dm.heightPixels)
                 val h = (rh0 - dy).toInt().coerceIn(c.dp(320), maxOf(c.dp(320), maxH))
                 if (w != lp.width || h != lp.height) {
                     lp.width = w; lp.height = h
@@ -391,6 +431,14 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         if (!wide && (resizing || ev.actionMasked == android.view.MotionEvent.ACTION_DOWN)) {
             if (resizeTouch(ev)) return true
         }
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> { pend = null; downX = ev.rawX; downY = ev.rawY }
+            android.view.MotionEvent.ACTION_MOVE -> if (pend != null && !dragging &&
+                Math.hypot((ev.rawX - downX).toDouble(), (ev.rawY - downY).toDouble()) > c.dp(12) && canDrag()) {
+                beginDrag(); return true
+            }
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> pend = null
+        }
         if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
             val loc = IntArray(2)
             search.getLocationOnScreen(loc)
@@ -407,7 +455,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
 
     override fun dispatchKeyEvent(e: KeyEvent): Boolean {
         if (e.action == KeyEvent.ACTION_UP && (e.keyCode == KeyEvent.KEYCODE_BACK || e.keyCode == KeyEvent.KEYCODE_ESCAPE)) {
-            val imeVisible = try { rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true } catch (_: Exception) { false }
+            val imeVisible = Compat.imeVisible(this)
             if (imeVisible) {
                 val imm = c.getSystemService(InputMethodManager::class.java)
                 imm?.hideSoftInputFromWindow(search.windowToken, 0)
@@ -422,8 +470,65 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
 
     private fun launch(a: AppInfo) { Launch.app(c, a.comp); onClose() }
 
-    private fun showAppMenu(a: AppInfo, x: Int, y: Int, target: View? = null) {
+    /** Open, Copy to Desktop, Move to Desktop, Create shortcut, Delete (to the trash). [after] runs when the list should refresh. */
+    private fun fileMenuItems(f: File, open: () -> Unit, after: () -> Unit): List<MenuItem> = listOf(
+        MenuItem("Open") { open() },
+        MenuItem("Copy to Desktop") { toDesktop(f, false, after) },
+        MenuItem("Move to Desktop") { toDesktop(f, true, after) },
+        MenuItem("Create shortcut on Desktop") {
+            if (DeskDrag.makeShortcut(c, f) != null) { Bus.fire(); c.toast(UiText.text(c, "Shortcut created on Desktop")) }
+            else c.toast(UiText.text(c, "Could not create shortcut"))
+        },
+        MenuItem("Delete") {
+            bg.execute {
+                val ok = TrashStore.trash(c, f)
+                main.post { c.toast(UiText.text(c, if (ok) "Moved to trash" else "Could not move to trash")); if (ok) after() }
+            }
+        }
+    )
+
+    private fun toDesktop(f: File, move: Boolean, after: () -> Unit) {
+        bg.execute {
+            val ok = try {
+                val dest = Files.unique(Files.root(c), f.name)
+                if (f.isDirectory && dest.absolutePath.startsWith(f.absolutePath + "/")) false
+                else { if (move) Files.move(f, dest) else Files.copyRec(f, dest); dest.exists() }
+            } catch (_: Exception) { false }
+            Bus.fire()
+            main.post {
+                c.toast(UiText.text(c, if (!ok) "Failed" else if (move) "Moved to Desktop" else "Copied to Desktop"))
+                if (ok && move) after()
+            }
+        }
+    }
+
+    /** Long press on an icon: if the finger now moves, the menu goes away and the icon is carried to the desktop. */
+    private fun armDrag(p: DeskDrag.Payload, icon: android.graphics.drawable.Drawable?) { pend = p; pendIcon = icon }
+
+    private fun beginDrag() {
+        val p = pend ?: return
+        pend = null
         menu?.dismiss()
+        hideKeyboardIfVisible()
+        if (DeskDrag.start(this, p, pendIcon)) {
+            dragging = true
+            alpha = 0f
+            dragHook?.invoke(true)
+            // safety net: if the end of the drag is never reported, bring the drawer back
+            postDelayed({ if (dragging) { dragging = false; dragHook?.invoke(false); alpha = 1f } }, 40000)
+        }
+    }
+
+    private fun dragEnded(dropped: Boolean) {
+        if (!dragging) return
+        dragging = false
+        dragHook?.invoke(false)
+        if (dropped) onClose() else alpha = 1f
+    }
+
+    private fun showAppMenu(a: AppInfo, x: Int, y: Int, target: View? = null, drag: Boolean = true) {
+        menu?.dismiss()
+        if (drag) armDrag(DeskDrag.Payload(DeskDrag.APP, a.comp.flattenToString()), Icons.app(c, a.comp, false))
         val pinned = Prefs.list(c, Prefs.K_PINNED).contains(a.comp.flattenToString())
         val m = PopupMenuX(c, this)
         m.spotlight = target
@@ -449,7 +554,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         bg.execute {
             try {
                 val la = c.getSystemService(LauncherApps::class.java)
-                if (!la.hasShortcutHostPermission()) return@execute
+                if (android.os.Build.VERSION.SDK_INT < 25 || !la.hasShortcutHostPermission()) return@execute
                 val out = ArrayList<ShortcutInfo>()
                 val flags = LauncherApps.ShortcutQuery.FLAG_MATCH_DYNAMIC or
                     LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST or
@@ -497,6 +602,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         if (query.isNotEmpty()) searchMode = true
         val my = ++gen
         apps = if (query.isEmpty()) allApps else allApps.filter { it.label.contains(query, ignoreCase = true) }
+        if (query.isNotEmpty() && apps.isNotEmpty()) Prefs.setList(c, "lastApps", apps.take(8).map { it.comp.flattenToString() }, fire = false)
         gridAdapter.notifyDataSetChanged()
         render()
         if (!searchMode && query.isEmpty()) return
@@ -524,8 +630,15 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             out += Result(true, "Recent")
             for (q in rec.take(4)) out += Result(false, q, custom = { recentRow(q) })
         }
-        if (apps.isNotEmpty()) { out += Result(true, "Apps"); out += Result(false, "", custom = { appsBlock() }) }
+        // the apps row shows what the last search found (until the next search); no earlier search = the first apps
+        val last = lastSearchApps()
+        if (last.isNotEmpty()) { out += Result(true, "Apps"); out += Result(false, "", custom = { appsBlock(last, true) }) }
+        else if (apps.isNotEmpty()) { out += Result(true, "Apps"); out += Result(false, "", custom = { appsBlock() }) }
         return out
+    }
+
+    private fun lastSearchApps(): List<AppInfo> = Prefs.list(c, "lastApps").mapNotNull { s ->
+        ComponentName.unflattenFromString(s)?.let { cn -> allApps.firstOrNull { it.comp == cn } }
     }
 
     private fun recentRow(q: String): View {
@@ -547,10 +660,10 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
     }
 
     /** Apps in two rows of four, plus a "More apps" link when there are more. */
-    private fun appsBlock(): View {
+    private fun appsBlock(list: List<AppInfo> = apps, fromLast: Boolean = false): View {
         val col = LinearLayout(c)
         col.orientation = LinearLayout.VERTICAL
-        val shown = apps.take(8)
+        val shown = list.take(8)
         for (r in 0 until 2) {
             if (r * 4 >= shown.size) break
             val row = LinearLayout(c)
@@ -562,7 +675,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                     val cell = AppCell(c)
                     cell.bind(a)
                     cell.setOnClickListener { remember(); launch(a) }
-                    cell.setSecondaryClick { x, y -> showAppMenu(a, x, y, cell) }
+                    cell.setSecondaryClick { x, y -> showAppMenu(a, x, y, cell, false) }
                     cell.setOnLongClickListener { v ->
                         val loc = IntArray(2); v.getLocationOnScreen(loc)
                         showAppMenu(a, loc[0] + v.width / 2, loc[1] + v.height / 2, v); true
@@ -572,7 +685,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             }
             col.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
         }
-        if (apps.size > 8) {
+        if (list.size > 8 || (fromLast && allApps.size > list.size)) {
             val more = TextView(c)
             more.text = UiText.text(c, "More apps")
             more.textSize = 14f
@@ -668,15 +781,13 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             row.setOnClickListener { Files.open(c, f); onClose() }
             row.setOnLongClickListener { v ->
                 val loc = IntArray(2); v.getLocationOnScreen(loc)
-                PopupMenuX(c, this).also { it.spotlight = v }.show(loc[0], loc[1] + v.height, listOf(
-                    MenuItem("Open") { Files.open(c, f); onClose() },
-                    MenuItem("Create shortcut on Desktop") {
-                        if (Downloads.createShortcut(c, f)) {
-                            c.toast(UiText.text(c, "Shortcut created on Desktop"))
-                            dlFiles = dlFiles.filter { it.file != f }; refreshHome()
-                        } else c.toast(UiText.text(c, "Could not create shortcut"))
-                    }
-                ))
+                menu?.dismiss()
+                armDrag(DeskDrag.Payload(DeskDrag.FILE, f.absolutePath), Icons.file(f))
+                val pm = PopupMenuX(c, this).also { it.spotlight = v }
+                menu = pm
+                pm.show(loc[0], loc[1] + v.height, fileMenuItems(f, { Files.open(c, f); onClose() }) {
+                    dlFiles = dlFiles.filter { it.file != f }; refreshHome()
+                })
                 true
             }
             inner.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
@@ -778,8 +889,9 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
         val fs = searchFiles(q)
         if (fs.isNotEmpty()) {
             out += Result(true, "Files")
-            val visibleFiles = if (showAllFiles) fs else fs.take(5)
-            for (f in visibleFiles) out += Result(false, f.name, f.parent ?: "", Icons.file(f), f, action = {
+            val dirs = fs.filter { it.isDirectory }; val plain = fs.filter { !it.isDirectory }
+            val visibleFiles = if (showAllFiles) fs else dirs.take(4) + plain.take(5)
+            for (f in visibleFiles) out += Result(false, f.shown(), f.parent ?: "", Icons.file(f), f, action = {
                 if (f.extension == "desktoplink") {
                     try {
                         val target = f.readLines().getOrNull(1)?.let { File(it) }
@@ -787,7 +899,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
                     } catch (_: Exception) { c.toast("Invalid shortcut") }
                 } else Files.open(c, f)
             })
-            if (fs.size > 5) {
+            if (showAllFiles || fs.size > visibleFiles.size) {
                 val toggleLabel = if (showAllFiles) "Hide all files" else "See all files"
                 val toggleSub = if (showAllFiles) "Show only the first 5 results" else "Show all matching results"
                 out += Result(false, toggleLabel, toggleSub, action = {
@@ -834,7 +946,33 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             Files.root(c).listFiles()?.filter { it.name.lowercase().contains(q.lowercase()) && res.none { r -> r == it } }
                 ?.take(6)?.let { res.addAll(0, it) }
         } catch (_: Exception) {}
-        return res.distinctBy { it.absolutePath }
+        val all = (findFolders(q) + res).distinctBy { it.absolutePath }.filter { !it.name.startsWith(".") }
+        // folders first (names that start with the text before the others), then the files
+        val ql = q.lowercase()
+        val dirs = all.filter { it.isDirectory }.sortedWith(compareBy({ !it.name.lowercase().startsWith(ql) }, { it.absolutePath.count { ch -> ch == '/' } }, { it.name.lowercase() }))
+        return dirs + all.filter { !it.isDirectory }
+    }
+
+    /** Folders of the device whose name contains the text (looks a few levels deep, skips hidden and Android's private folders). */
+    private fun findFolders(q: String): List<File> {
+        val out = ArrayList<File>()
+        val ql = q.lowercase()
+        val end = System.currentTimeMillis() + 700
+        var visited = 0
+        val queue = java.util.ArrayDeque<Pair<File, Int>>()
+        queue.add(android.os.Environment.getExternalStorageDirectory() to 0)
+        while (queue.isNotEmpty() && out.size < 40 && visited < 8000 && System.currentTimeMillis() < end) {
+            val (dir, depth) = queue.poll()
+            val kids = try { dir.listFiles() } catch (_: Exception) { null } ?: continue
+            for (k in kids) {
+                if (!k.isDirectory || k.name.startsWith(".")) continue
+                if (depth == 0 && k.name == "Android") continue
+                visited++
+                if (k.name.lowercase().contains(ql)) out += k
+                if (depth < 4) queue.add(k to depth + 1)
+            }
+        }
+        return out
     }
 
     private fun inAppSearches(q: String): List<Pair<String, () -> Intent>> {
@@ -904,7 +1042,7 @@ class DrawerView(private val c: Context, private val bottomMargin: Int, private 
             }
             orientation = VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, ctx.dp(4), 0, ctx.dp(4))
+            setPadding(ctx.dp(6), ctx.dp(4), ctx.dp(6), ctx.dp(4))
             addView(icon, LayoutParams(ctx.dp(48), ctx.dp(48)))
             label.textSize = 12f
             label.maxLines = 2

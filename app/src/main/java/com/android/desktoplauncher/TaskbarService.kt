@@ -22,7 +22,9 @@ import android.widget.TextClock
 import android.view.ContextThemeWrapper
 import android.util.Log
 import android.app.ActivityManager
+import android.graphics.Bitmap
 import android.os.Handler
+import android.os.SystemClock
 import android.os.Looper
 
 /**
@@ -33,7 +35,12 @@ interface TaskbarHost {
     val running: Collection<String>
     val focused: String?
     fun global(action: Int)
+    /** Long press on Back (0), Home (1) or Recents (2). */
+    fun navLong(kind: Int) {}
     fun hideRunning(pkg: String)
+    /** Ends the app's tasks (like swiping it away in Recents); only possible when the launcher is a system app. */
+    fun closeApp(pkg: String) {}
+    fun canClose(): Boolean = false
     fun toggleDrawer()
     fun openSearch()
     val imeShown: Boolean
@@ -51,6 +58,9 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
     /** 0 = bar along the bottom; 1 / 2 = vertical bar over a system navigation bar on the left / right edge. */
     private var barSide = 0
     private var barShown = true
+    private var tintReq: Runnable? = null
+    private var lastShot = 0L
+    private var tintKey: String? = null
     private var drawer: DrawerView? = null
     override val running = LinkedHashSet<String>()
     override var focused: String? = null
@@ -63,7 +73,7 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
     private val dismissed = HashSet<String>()
     private val handler = Handler(Looper.getMainLooper())
     private val pruneTick = object : Runnable {
-        override fun run() { pruneDead(); handler.postDelayed(this, 4000) }
+        override fun run() { if (!syncTasks()) pruneDead(); if (bar != null) { navWin = detectNavWin(); setBarShown(systemBarsVisible() || navWin) }; handler.postDelayed(this, if (SysTasks.trusted(this@TaskbarService)) 1500 else 4000) }
     }
 
     override fun onServiceConnected() {
@@ -103,6 +113,7 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
                 scan()
             }
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                requestTint()
                 if (e.packageName?.toString() != editPkg && e.className?.toString()?.contains("InputMethod") != true) editing = false
                 scan()
             }
@@ -187,6 +198,15 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
             }
         } catch (_: Exception) {}
         var changed = false
+        // As a system app the list comes from the system itself (the Recents list): an app is "running" exactly while its task exists.
+        if (syncTasks(fg)) {
+            var c2 = taskCh
+            if (fg != focused) { focused = fg; c2 = true }
+            val ime0 = imeWin || editing
+            if (ime0 != imeShown) { imeShown = ime0; c2 = true }
+            if (c2) bar?.refresh()
+            navWin = detectNavWin(); sync(false); return
+        }
         // Keep a short recent-app list, not just windows visible on this exact frame.
         // Order is kept (first opened = first) so the taskbar does not jump around while scrolling.
         val prevFocus = focused
@@ -201,12 +221,57 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
         val ime = imeWin || editing
         if (ime != imeShown) { imeShown = ime; changed = true }
         if (changed) bar?.refresh()
+        navWin = detectNavWin()
         // Accessibility events also arrive when the keyguard is shown/hidden.
         sync(false)
     }
 
+    /**
+     * System-app mode: rebuilds [running] from the system's task list. Returns false (and changes nothing) when the system does not
+     * show other apps' tasks, i.e. when the launcher is an ordinary app.
+     */
+    private var taskCh = false
+    private fun syncTasks(fg: String? = null): Boolean {
+        val l = SysTasks.tasks(this) ?: return false
+        val homes = try {
+            packageManager.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0).map { it.activityInfo.packageName }.toSet()
+        } catch (_: Exception) { emptySet() }
+        val alive = LinkedHashSet<String>()
+        for (t in l) if (!skip(t.pkg) && t.pkg !in homes) alive += t.pkg
+        dismissed.retainAll(alive)          // a hidden app that has no task any more may come back when it is opened again
+        val f = fg ?: focused
+        val pk = LinkedHashSet<String>()
+        for (p in alive) { if (p in dismissed) { if (p == f && p != focused) dismissed.remove(p) else continue }; pk += p }
+        var ch = running.retainAll(pk)
+        for (p in pk) if (running.add(p)) ch = true
+        taskCh = ch
+        if (ch && bar != null && fg == null) bar?.refresh()
+        return true
+    }
+
     override fun hideRunning(pkg: String) { running.remove(pkg); dismissed.add(pkg); bar?.refresh() }
+    override fun closeApp(pkg: String) { Thread { SysTasks.removeApp(this, pkg); handler.post { running.remove(pkg); bar?.refresh() } }.start() }
+    override fun canClose(): Boolean = SysTasks.trusted(this)
     override fun global(action: Int) { performGlobalAction(action) }
+
+    override fun navLong(kind: Int) {
+        val key = when (kind) { 0 -> Prefs.K_LP_BACK; 1 -> Prefs.K_LP_HOME; else -> Prefs.K_LP_RECENTS }
+        try {
+            when (Prefs.getInt(this, key, if (kind == 1) NavActions.ASSIST else NavActions.NONE)) {
+                NavActions.ASSIST -> startActivity(Intent(Intent.ACTION_ASSIST).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                NavActions.SPLIT -> performGlobalAction(GLOBAL_ACTION_TOGGLE_SPLIT_SCREEN)
+                NavActions.SHOT -> performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
+                NavActions.LOCK -> performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                NavActions.POWER -> performGlobalAction(GLOBAL_ACTION_POWER_DIALOG)
+                NavActions.NOTIF -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+                NavActions.QS -> performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
+                NavActions.DRAWER -> toggleDrawer()
+                NavActions.BACK -> performGlobalAction(GLOBAL_ACTION_BACK)
+                NavActions.HOME -> performGlobalAction(GLOBAL_ACTION_HOME)
+                NavActions.RECENTS -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+            }
+        } catch (e: Exception) { Log.e("DesktopTaskbar", "Long-press action failed", e) }
+    }
     override fun openSearch() {
         if (drawer == null) openDrawer()
         drawer?.post { drawer?.focusSearch() }
@@ -215,6 +280,7 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
         sync()
+        requestTint(700)
     }
 
     /** Re-reads preferences: adds/removes the bar and updates its size. */
@@ -224,7 +290,10 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
             if (!Prefs.bool(this, Prefs.K_TASKBAR, true) || !Modes.tablet(this) || keyguardLocked) {
                 removeBar(); closeDrawer(); return
             }
-            val side = navSide()
+            // While the system bars are hidden (video, fullscreen) keep the bar where it was and just hide it.
+            val insetVis = systemBarsVisible()
+            val vis = insetVis || navWin
+            val side = if (insetVis) navSide() else barSide
             if (bar != null && barSide != side) removeBar()
             val b = bar
             if (b != null && side != 0) {
@@ -241,6 +310,8 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
                 }
                 if (refresh) b.refresh()
             }
+            setBarShown(vis)
+            requestTint(300)
         } catch (e: Exception) {
             Log.e("DesktopTaskbar", "Taskbar sync failed", e)
             removeBar()
@@ -249,12 +320,55 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
 
     /** Which screen edge the system navigation bar is on when it is a side bar (phone in landscape); 0 otherwise. */
     private fun navSide(): Int = try {
-        val i = wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.navigationBars())
-        if (i.right > 0) 2 else if (i.left > 0) 1 else 0
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            val i = wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.navigationBars())
+            if (i.right > 0) 2 else if (i.left > 0) 1 else 0
+        } else @Suppress("DEPRECATION") {
+            // Android 7-10: the usable width is narrower than the real one when a bar sits on a side
+            val real = android.graphics.Point(); val app = android.graphics.Point()
+            wm.defaultDisplay.getRealSize(real); wm.defaultDisplay.getSize(app)
+            if (real.x - app.x > 0) (if (wm.defaultDisplay.rotation == android.view.Surface.ROTATION_270) 1 else 2) else 0
+        }
     } catch (_: Exception) { 0 }
 
+    /** Screen size in pixels (WindowMetrics exists from Android 11). */
+    private fun screenBounds(): android.graphics.Rect =
+        if (android.os.Build.VERSION.SDK_INT >= 30) wm.currentWindowMetrics.bounds
+        else @Suppress("DEPRECATION") run { val p = android.graphics.Point(); wm.defaultDisplay.getRealSize(p); android.graphics.Rect(0, 0, p.x, p.y) }
+
+    /** False while both the navigation bar and the status bar are hidden. The metrics only count bars that are showing. */
+    private fun systemBarsVisible(): Boolean = try {
+        if (android.os.Build.VERSION.SDK_INT < 30) true else {   // Android 7-10 cannot tell: the taskbar simply stays
+        val w = wm.currentWindowMetrics.windowInsets
+        val n = w.getInsets(android.view.WindowInsets.Type.navigationBars())
+        val st = w.getInsets(android.view.WindowInsets.Type.statusBars())
+        n.left + n.right + n.bottom + n.top + st.top > 0
+        }
+    } catch (_: Exception) { true }
+
+    /**
+     * The buttons that swipe up from the edge (or appear when the mouse touches the edge) are the system's own navigation bar
+     * window; it only exists while they are showing. The insets do not report these short-lived ("transient") bars.
+     */
+    private var navWin = false
+
+    private fun detectNavWin(): Boolean = try {
+        val b = screenBounds()
+        val sw = b.width(); val sh = b.height()
+        val r = android.graphics.Rect()
+        windows.any { w ->
+            if (w.type != AccessibilityWindowInfo.TYPE_SYSTEM) return@any false
+            w.getBoundsInScreen(r)
+            if (r.left < 0 || r.top < 0 || r.right > sw || r.bottom > sh || r.isEmpty) return@any false
+            val bottomStrip = r.bottom >= sh - 2 && r.height() <= sh / 4 && r.width() >= sw / 2
+            val sideStrip = (r.left <= 2 || r.right >= sw - 2) && r.width() <= sw / 4 && r.height() >= sh / 2
+            bottomStrip || sideStrip
+        }
+    } catch (_: Exception) { false }
+
     private fun statusTop(): Int = try {
-        wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.statusBars()).top
+        if (android.os.Build.VERSION.SDK_INT >= 30) wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.statusBars()).top
+        else Compat.statusBarHeight(this)
     } catch (_: Exception) { 0 }
 
     private fun addBar() {
@@ -263,7 +377,7 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
             val side = navSide()
             val thick = uctx.dp(Prefs.tbDp(this))
             val top = if (side != 0) statusTop() else 0
-            val len = wm.currentWindowMetrics.bounds.height()
+            val len = screenBounds().height()
             v = TaskbarView(uctx, this, true, false, side, len, top)
             val lp = WindowManager.LayoutParams(
                 if (side != 0) thick else MATCH, if (side != 0) len else thick,
@@ -275,22 +389,44 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
                 PixelFormat.TRANSLUCENT
             )
             lp.gravity = if (side == 0) Gravity.BOTTOM else Gravity.TOP or (if (side == 2) Gravity.END else Gravity.START)
-            lp.setFitInsetsTypes(0)
+            if (android.os.Build.VERSION.SDK_INT >= 30) lp.setFitInsetsTypes(0)
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             // not under the punch hole or a side navigation bar in landscape
             val si = Insets.safe(uctx)
             if (side == 0 && si.left + si.right > 0) {
-                lp.width = wm.currentWindowMetrics.bounds.width() - si.left - si.right
+                lp.width = screenBounds().width() - si.left - si.right
                 lp.x = (si.left - si.right) / 2
             }
             lp.title = "DesktopTaskbar"
             Blur.apply(lp, uctx, 24)
-            wm.addView(v, lp)
+            // Experiment (system app, Android 14+, bottom bar): the same kind of window the system navigation bar is, so that apps stop above it
+            // instead of going under it. The system only allows this to apps signed with the platform key; if it is refused we fall back
+            // to the ordinary overlay and the reason is shown in Windows > Freeform test.
+            var added = false
+            if (side == 0 && NavWin.wanted(this)) {
+                try {
+                    lp.type = 2019   // TYPE_NAVIGATION_BAR
+                    lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    try {
+                        val f = WindowManager.LayoutParams::class.java.getField("privateFlags")
+                        f.setInt(lp, f.getInt(lp) or 0x40)
+                    } catch (_: Throwable) {}
+                    wm.addView(v, lp)
+                    added = true
+                    NavWin.status = "accepted: the taskbar is a navigation-bar window"
+                } catch (t: Throwable) {
+                    NavWin.status = "refused: " + t.javaClass.simpleName + ": " + (t.message ?: "")
+                    Log.w("DesktopTaskbar", "Navigation-bar window refused, using the overlay", t)
+                    lp.type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                    try { wm.removeViewImmediate(v) } catch (_: Throwable) {}
+                }
+            }
+            if (!added) wm.addView(v, lp)
             bar = v
             barSide = side
             barShown = true
             // follow the system bars: hidden in video / fullscreen, back when the system buttons come back
-            v.onSystemBars = { visible -> setBarShown(visible) }
+            v.onInsets = { handler.post { sync(false) } }
         } catch (e: Exception) {
             Log.e("DesktopTaskbar", "Could not add taskbar overlay", e)
             if (v != null) try { wm.removeView(v) } catch (_: Exception) {}
@@ -315,6 +451,68 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
         }
     }
 
+    /** Experimental: asks for a screenshot shortly after the app changes and tints the bar with the colour of the system navigation strip. */
+    private fun requestTint(delay: Long = 500) {
+        tintReq?.let { handler.removeCallbacks(it) }
+        val r = Runnable { sampleTint() }
+        tintReq = r
+        handler.postDelayed(r, delay)
+    }
+
+    private fun sampleTint() {
+        val b = bar ?: return
+        // the colour sample uses AccessibilityService.takeScreenshot, which exists from Android 11
+        if (android.os.Build.VERSION.SDK_INT < 30 || !Prefs.bool(this, Prefs.K_APPCOLOR, false)) { b.tint = null; tintKey = null; return }
+        if (!barShown || focused == null || focused == packageName) { b.tint = null; tintKey = null; return }
+        // only look again when the app or the screen direction changed (the bar flickers for a moment while it is sampled)
+        val key = "$focused|$barSide|${resources.configuration.orientation}"
+        if (key == tintKey) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastShot < 1100) { requestTint(1150 - (now - lastShot)); return }
+        lastShot = now
+        tintKey = key
+        fun restore() { b.alpha = if (barShown) 1f else 0f }
+        b.alpha = 0f   // so the bar itself is not in the picture
+        handler.postDelayed({
+            try {
+                takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                        restore()
+                        b.tint = try { stripColor(r) } catch (e: Exception) { Log.e("DesktopTaskbar", "colour sample failed", e); null }
+                    }
+                    override fun onFailure(code: Int) { restore() }
+                })
+            } catch (e: Exception) { restore() }
+        }, 90)
+    }
+
+    /** Average colour of a few points on the strip where the system navigation bar sits, or null when they differ too much. */
+    private fun stripColor(r: AccessibilityService.ScreenshotResult): Int? {
+        val hb = r.hardwareBuffer
+        val hw = Bitmap.wrapHardwareBuffer(hb, r.colorSpace) ?: run { hb.close(); return null }
+        val bmp = hw.copy(Bitmap.Config.ARGB_8888, false)
+        hb.close()
+        if (bmp == null) return null
+        val w = bmp.width; val h = bmp.height
+        val pts = ArrayList<Pair<Int, Int>>()
+        when (barSide) {
+            0 -> for (f in floatArrayOf(0.04f, 0.1f, 0.9f, 0.96f)) pts += Pair((w * f).toInt(), h - 3)
+            2 -> for (f in floatArrayOf(0.25f, 0.45f, 0.65f, 0.85f)) pts += Pair(w - 3, (h * f).toInt())
+            else -> for (f in floatArrayOf(0.25f, 0.45f, 0.65f, 0.85f)) pts += Pair(2, (h * f).toInt())
+        }
+        val cols = pts.map { bmp.getPixel(it.first.coerceIn(0, w - 1), it.second.coerceIn(0, h - 1)) }
+        bmp.recycle()
+        for (a in cols) for (c in cols) {
+            if (Math.abs(android.graphics.Color.red(a) - android.graphics.Color.red(c)) > 36 ||
+                Math.abs(android.graphics.Color.green(a) - android.graphics.Color.green(c)) > 36 ||
+                Math.abs(android.graphics.Color.blue(a) - android.graphics.Color.blue(c)) > 36) return null
+        }
+        val rr = cols.sumOf { android.graphics.Color.red(it) } / cols.size
+        val gg = cols.sumOf { android.graphics.Color.green(it) } / cols.size
+        val bb = cols.sumOf { android.graphics.Color.blue(it) } / cols.size
+        return android.graphics.Color.rgb(rr, gg, bb)
+    }
+
     private fun removeBar() {
         bar?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         bar = null
@@ -326,10 +524,20 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
         if (drawer != null) return
         val barH = if (bar != null && barSide == 0) uctx.dp(Prefs.tbDp(this)) else 0
         val barW = if (bar != null && barSide != 0) uctx.dp(Prefs.tbDp(this)) else 0
-        val screenH = wm.currentWindowMetrics.bounds.height()
+        val screenH = screenBounds().height()
         val d = DrawerView(uctx, uctx.dp(8), false, if (barW > 0) barSide else 0) { closeDrawer() }
+        d.dragHook = { on ->
+            // while an icon is carried, the drawer window lets touches / drops through to the desktop
+            try {
+                val dlp = d.layoutParams as WindowManager.LayoutParams
+                dlp.flags = if (on) dlp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            else dlp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                wm.updateViewLayout(d, dlp)
+            } catch (_: Exception) {}
+            LauncherActivity.blurFromOverlay(!on && drawer === d)
+        }
         val lp = WindowManager.LayoutParams(
-            if (barW > 0) wm.currentWindowMetrics.bounds.width() - barW else MATCH, screenH - barH - (if (barW > 0) statusTop() else 0),
+            if (barW > 0) screenBounds().width() - barW else MATCH, screenH - barH - (if (barW > 0) statusTop() else 0),
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
@@ -338,7 +546,7 @@ class TaskbarService : AccessibilityService(), TaskbarHost {
         )
         lp.gravity = Gravity.TOP or (if (barSide == 1) Gravity.END else Gravity.START)
         if (barW > 0) lp.y = statusTop()
-        lp.setFitInsetsTypes(0)
+        if (android.os.Build.VERSION.SDK_INT >= 30) lp.setFitInsetsTypes(0)
         lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
         lp.title = "DesktopDrawer"
         // Do not use BLUR_BEHIND on this full-screen touch layer: Android blurs the entire
@@ -379,14 +587,25 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
      * Side mode: the whole bar is laid out horizontally in [body] (len x thickness) and turned 90 degrees so it lies along the
      * screen edge; the icons are turned back, so they stay upright like the system navigation buttons do.
      */
-    /** Set by the service: called with false when the system bars are hidden (video, fullscreen) and true when they return. */
-    var onSystemBars: ((Boolean) -> Unit)? = null
+    /** Set by the service: called when the window insets change, so it can check whether the system bars are showing. */
+    var onInsets: (() -> Unit)? = null
+
+    /** Colour taken from the open app (null = normal Material You colour). Set by the service when the option is on. */
+    var tint: Int? = null
+        set(v) { if (field != v) { field = v; refresh() } }
+
+    /** Icon colour that reads well on the tint. */
+    val fg: Int? get() = tint?.let { t ->
+        val lum = (0.299f * android.graphics.Color.red(t) + 0.587f * android.graphics.Color.green(t) + 0.114f * android.graphics.Color.blue(t)) / 255f
+        if (lum < 0.55f) 0xFFFFFFFF.toInt() else 0xFF1B1B1F.toInt()
+    }
     private val body: FrameLayout? = if (side != 0) FrameLayout(ctx) else null
     private val host: FrameLayout get() = body ?: this
     private val center = LinearLayout(ctx)
     private val right = LinearLayout(ctx)
     private val appsRow = LinearLayout(ctx)
-    private val scroll = android.widget.HorizontalScrollView(ctx)
+    private var curCell = 0
+    private val scroll = SnapScroll(ctx) { curCell }
     private var menu: PopupMenuX? = null
     private var lastFocused: String? = null
 
@@ -408,11 +627,7 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
         scroll.overScrollMode = View.OVER_SCROLL_NEVER
         scroll.clipToPadding = false
         scroll.addView(appsRow, FrameLayout.LayoutParams(WRAP, MATCH))
-        if (showNav) setOnApplyWindowInsetsListener { _, ins ->
-            // hidden only when neither the navigation bar nor the status bar is visible
-            onSystemBars?.invoke(ins.isVisible(android.view.WindowInsets.Type.navigationBars()) || ins.isVisible(android.view.WindowInsets.Type.statusBars()))
-            ins
-        }
+        if (showNav) setOnApplyWindowInsetsListener { _, ins -> onInsets?.invoke(); ins }
         host.addView(center, LayoutParams(MATCH, MATCH, Gravity.START or Gravity.CENTER_VERTICAL).also {
             it.leftMargin = ctx.dp(4)
         })
@@ -445,7 +660,8 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
         RippleDrawable(ColorStateList.valueOf(0x33000000), null, Colors.rounded(0xFFFFFFFF.toInt(), ctx.dp(10).toFloat()))
 
     fun refresh() {
-        val bg = if (pill) Colors.panel(ctx, Colors.taskbar(ctx), ctx.dp(28).toFloat()) else android.graphics.drawable.ColorDrawable(Colors.taskbar(ctx))
+        val barCol = tint?.let { Colors.glass(ctx, it) } ?: Colors.taskbar(ctx)
+        val bg = if (pill) Colors.panel(ctx, barCol, ctx.dp(28).toFloat()) else android.graphics.drawable.ColorDrawable(barCol)
         if (body != null) body.background = bg else background = bg
         // Keep the scroll position across rebuilds (the strip used to jump back to the start).
         val keepX = scroll.scrollX
@@ -454,6 +670,7 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
         appsRow.removeAllViews()
         val h = ctx.dp(Prefs.tbDp(ctx))
         val cell = minOf(h, ctx.dp(52))
+        curCell = cell
         right.visibility = if (showNav) View.VISIBLE else View.GONE
 
         center.addView(StartButton(ctx).also {
@@ -477,7 +694,7 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
         val unpinned = svc.running.filter { it !in shownPk }.mapNotNull { pkg -> AppRepo.byPkg(ctx, pkg)?.let { pkg to it.comp } }
         if (unpinned.isNotEmpty() && pinned.isNotEmpty()) {
             val divider = View(ctx)
-            divider.setBackgroundColor(Colors.text(ctx) and 0x55FFFFFF)
+            divider.setBackgroundColor((fg ?: Colors.text(ctx)) and 0x55FFFFFF)
             appsRow.addView(divider, LinearLayout.LayoutParams(ctx.dp(1), (h * 0.58f).toInt()).also {
                 it.leftMargin = ctx.dp(5); it.rightMargin = ctx.dp(5)
             })
@@ -513,17 +730,20 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
         if (showNav && Prefs.bool(ctx, Prefs.K_NAV, true)) {
             right.addView(NavButton(ctx, 0).also { b ->
                 b.background = ripple(); b.setOnClickListener { svc.global(AccessibilityService.GLOBAL_ACTION_BACK) }
+                b.setOnLongClickListener { it.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS); svc.navLong(0); true }
             }, LinearLayout.LayoutParams(cell, MATCH))
             right.addView(NavButton(ctx, 1).also { b ->
                 b.background = ripple(); b.setOnClickListener { svc.global(AccessibilityService.GLOBAL_ACTION_HOME) }
+                b.setOnLongClickListener { it.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS); svc.navLong(1); true }
             }, LinearLayout.LayoutParams(cell, MATCH))
             right.addView(NavButton(ctx, 2).also { b ->
                 b.background = ripple(); b.setOnClickListener { svc.global(AccessibilityService.GLOBAL_ACTION_RECENTS) }
+                b.setOnLongClickListener { it.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS); svc.navLong(2); true }
             }, LinearLayout.LayoutParams(cell, MATCH))
         }
         if (showNav && body == null) {
             // taskbar mode: the category button takes the place of the time
-            val pill = CatPill(ctx, 68, 22) { (Colors.iconBg(ctx) and 0x00FFFFFF) or 0xCC000000.toInt() }
+            val pill = CatPill(ctx, 68, 22, outline = { fg ?: Colors.accent(ctx) }, ink = { fg }) { (Colors.iconBg(ctx) and 0x00FFFFFF) or 0xCC000000.toInt() }
             pill.setOnClickListener {
                 Launch.start(ctx, android.content.Intent(ctx, LauncherActivity::class.java).setAction(LauncherActivity.ACTION_CATEGORIES))
             }
@@ -562,7 +782,7 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
         f.addView(ic, FrameLayout.LayoutParams(s, s, Gravity.CENTER))
         if (running) {
             val line = View(ctx)
-            line.background = Colors.rounded(Colors.accent(ctx), ctx.dp(2).toFloat())
+            line.background = Colors.rounded(fg ?: Colors.accent(ctx), ctx.dp(2).toFloat())
             f.addView(line, FrameLayout.LayoutParams(ctx.dp(if (active) 18 else 6), ctx.dp(3), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
                 .also { it.bottomMargin = ctx.dp(3) })
         }
@@ -578,6 +798,7 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
             items += MenuItem(if (pinned) "Unpin from taskbar" else "Pin to taskbar") {
                 Prefs.toggleInList(ctx, Prefs.K_PINNED, comp.flattenToString())
             }
+            if (running && svc.canClose()) items += MenuItem("Close") { svc.closeApp(comp.packageName) }
             if (running) items += MenuItem("Hide from taskbar") { svc.hideRunning(comp.packageName) }
             val loc = IntArray(2)
             getLocationOnScreen(loc)
@@ -595,7 +816,7 @@ class TaskbarView(private val ctx: Context, private val svc: TaskbarHost, privat
 class StartButton(c: Context) : View(c) {
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     override fun onDraw(canvas: Canvas) {
-        p.color = Colors.accent(context)
+        p.color = tintFg() ?: Colors.accent(context)
         val s = minOf(width, height) * 0.38f
         val step = s / 2f
         val r = s * 0.11f
@@ -609,7 +830,7 @@ class StartButton(c: Context) : View(c) {
 class ImeButton(c: Context) : View(c) {
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     override fun onDraw(canvas: Canvas) {
-        p.color = Colors.text(context)
+        p.color = barFg()
         p.strokeWidth = context.dp(2).toFloat() * 0.8f
         val cx = width / 2f
         val cy = height / 2f
@@ -621,22 +842,154 @@ class ImeButton(c: Context) : View(c) {
 }
 
 /** kind: 0 back, 1 home, 2 recents */
+/** Icon colour of a taskbar button: follows the bar's tint when it has one. */
+fun View.tintFg(): Int? {
+    var p = parent
+    while (p != null) { if (p is TaskbarView) return p.fg; p = p.parent }
+    return null
+}
+
+fun View.barFg(): Int = tintFg() ?: Colors.text(context)
+
+/**
+ * The app strip: only whole icons are visible at rest. The strip is as wide as a whole number of icons and, after a drag or
+ * mouse-wheel scroll, glides to the nearest icon edge, so no icon is ever cut in half at either end.
+ */
+class SnapScroll(c: Context, private val cell: () -> Int) : android.widget.HorizontalScrollView(c) {
+    private var touching = false
+    private val snap = Runnable {
+        val row = getChildAt(0) as? android.view.ViewGroup ?: return@Runnable
+        var best = scrollX
+        var bd = Int.MAX_VALUE
+        for (i in 0 until row.childCount) {
+            val d = Math.abs(row.getChildAt(i).left - scrollX)
+            if (d < bd) { bd = d; best = row.getChildAt(i).left }
+        }
+        val max = (row.width - width).coerceAtLeast(0)
+        best = best.coerceIn(0, max)
+        if (Math.abs(best - scrollX) > 1) smoothScrollTo(best, 0)
+    }
+
+    override fun onMeasure(w: Int, h: Int) {
+        val cw = cell()
+        val size = MeasureSpec.getSize(w)
+        if (cw > 0 && MeasureSpec.getMode(w) != MeasureSpec.UNSPECIFIED && size >= cw) {
+            super.onMeasure(MeasureSpec.makeMeasureSpec(size / cw * cw, MeasureSpec.EXACTLY), h)
+        } else super.onMeasure(w, h)
+    }
+
+    override fun onScrollChanged(l: Int, t: Int, ol: Int, ot: Int) {
+        super.onScrollChanged(l, t, ol, ot)
+        removeCallbacks(snap)
+        if (!touching) postDelayed(snap, 140)
+    }
+
+    override fun onTouchEvent(ev: android.view.MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> { touching = true; removeCallbacks(snap) }
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> { touching = false; removeCallbacks(snap); postDelayed(snap, 160) }
+        }
+        return super.onTouchEvent(ev)
+    }
+}
+
+/** What a long press on Back / Home / Recents can do. */
+object NavActions {
+    const val NONE = 0; const val ASSIST = 1; const val SPLIT = 2; const val SHOT = 3; const val LOCK = 4
+    const val POWER = 5; const val NOTIF = 6; const val QS = 7; const val DRAWER = 8
+    const val BACK = 9; const val HOME = 10; const val RECENTS = 11
+    val names = listOf("None", "Assistant (Circle to Search where the system allows)", "Split screen", "Screenshot", "Lock screen",
+        "Power menu", "Notifications", "Quick settings", "App drawer", "Back", "Home", "Recents")
+}
+
+/** Look of the Back / Home / Recents buttons. 0 = follows the phone's make. */
+object NavStyle {
+    const val SYSTEM = 0; const val LAUNCHER = 1; const val SAMSUNG = 2; const val PIXEL = 3; const val VIVO = 4; const val OPPO = 5; const val XIAOMI = 6
+    val names = listOf("System (like this phone)", "Desktop Launcher", "Samsung", "Pixel", "Vivo", "Oppo", "Xiaomi")
+
+    fun resolve(c: Context): Int {
+        val v = Prefs.getInt(c, Prefs.K_NAVSTYLE, SYSTEM)
+        if (v != SYSTEM) return v
+        val m = (android.os.Build.MANUFACTURER + " " + android.os.Build.BRAND).lowercase()
+        return when {
+            m.contains("xiaomi") || m.contains("redmi") || m.contains("poco") -> XIAOMI
+            m.contains("samsung") -> SAMSUNG
+            m.contains("vivo") || m.contains("iqoo") -> VIVO
+            m.contains("oppo") || m.contains("realme") || m.contains("oneplus") -> OPPO
+            else -> PIXEL
+        }
+    }
+}
+
 class NavButton(c: Context, private val kind: Int) : View(c) {
-    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeJoin = Paint.Join.ROUND }
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND }
+
+    private fun stroke(w: Float) { p.style = Paint.Style.STROKE; p.strokeWidth = w }
+    private fun fill(w: Float = 0f) { p.style = if (w > 0f) Paint.Style.FILL_AND_STROKE else Paint.Style.FILL; p.strokeWidth = w }
+
+    /** Triangle pointing left; filled ones get softly rounded corners from a round-joined outline of the same colour. */
+    private fun tri(cv: Canvas, cx: Float, cy: Float, r: Float, filled: Boolean, w: Float) {
+        val pad = if (filled) w / 2f else 0f
+        val path = Path()
+        path.moveTo(cx + r * 0.85f - pad, cy - r + pad); path.lineTo(cx - r * 0.85f + pad, cy); path.lineTo(cx + r * 0.85f - pad, cy + r - pad); path.close()
+        if (filled) fill(w) else stroke(w)
+        cv.drawPath(path, p)
+    }
+
+    private fun chevron(cv: Canvas, cx: Float, cy: Float, r: Float, w: Float) {
+        val path = Path()
+        path.moveTo(cx + r * 0.45f, cy - r * 0.95f); path.lineTo(cx - r * 0.45f, cy); path.lineTo(cx + r * 0.45f, cy + r * 0.95f)
+        stroke(w); cv.drawPath(path, p)
+    }
+
+    private fun square(cv: Canvas, cx: Float, cy: Float, r: Float, filled: Boolean, w: Float, corner: Float) {
+        val pad = if (filled) w / 2f else 0f
+        val rc = RectF(cx - r + pad, cy - r + pad, cx + r - pad, cy + r - pad)
+        if (filled) fill(w) else stroke(w)
+        cv.drawRoundRect(rc, corner, corner, p)
+    }
+
     override fun onDraw(canvas: Canvas) {
-        p.color = Colors.text(context)
-        p.strokeWidth = context.dp(2).toFloat()
+        p.color = barFg()
         val cx = width / 2f
         val cy = height / 2f
-        val r = minOf(width, height) * 0.17f
-        when (kind) {
-            0 -> {
-                val path = Path()
-                path.moveTo(cx + r, cy - r); path.lineTo(cx - r, cy); path.lineTo(cx + r, cy + r); path.close()
-                canvas.drawPath(path, p)
+        val r = minOf(width, height) * 0.17f      // same size as before: the shapes are about 0.34 of the cell
+        val dp2 = context.dp(2).toFloat()
+        when (NavStyle.resolve(context)) {
+            NavStyle.LAUNCHER -> when (kind) {
+                0 -> tri(canvas, cx, cy, r, false, dp2)
+                1 -> { stroke(dp2); canvas.drawCircle(cx, cy, r, p) }
+                else -> square(canvas, cx, cy, r, false, dp2, r * 0.35f)
             }
-            1 -> canvas.drawCircle(cx, cy, r, p)
-            else -> canvas.drawRoundRect(RectF(cx - r, cy - r, cx + r, cy + r), r * 0.35f, r * 0.35f, p)
+            NavStyle.XIAOMI -> when (kind) {
+                0 -> tri(canvas, cx, cy, r, true, r * 0.45f)
+                1 -> {   // thin ring, a gap, then a solid disc; a little larger than Back and Recents
+                    val big = r * 1.22f
+                    stroke(r * 0.15f); canvas.drawCircle(cx, cy, big - r * 0.075f, p)
+                    fill(); canvas.drawCircle(cx, cy, big * 0.66f, p)
+                }
+                else -> square(canvas, cx, cy, r * 0.95f, true, r * 0.3f, r * 0.4f)
+            }
+            NavStyle.PIXEL -> when (kind) {
+                0 -> tri(canvas, cx, cy, r, true, r * 0.5f)
+                1 -> { fill(); canvas.drawCircle(cx, cy, r, p) }
+                else -> square(canvas, cx, cy, r * 0.92f, true, r * 0.4f, r * 0.5f)
+            }
+            NavStyle.SAMSUNG -> when (kind) {
+                0 -> chevron(canvas, cx, cy, r, r * 0.3f)
+                1 -> { stroke(r * 0.26f); canvas.drawRoundRect(RectF(cx - r, cy - r, cx + r, cy + r), r * 0.6f, r * 0.6f, p) }   // rounded square
+                else -> { stroke(r * 0.28f); for (i in -1..1) canvas.drawLine(cx + i * r * 0.85f, cy - r * 0.9f, cx + i * r * 0.85f, cy + r * 0.9f, p) }
+            }
+            NavStyle.VIVO -> when (kind) {
+                0 -> chevron(canvas, cx, cy, r, r * 0.24f)
+                1 -> { stroke(r * 0.24f); canvas.drawCircle(cx, cy, r, p) }
+                else -> { stroke(r * 0.24f); for (i in -1..1) canvas.drawLine(cx - r * 0.9f, cy + i * r * 0.7f, cx + r * 0.9f, cy + i * r * 0.7f, p) }
+            }
+            else -> when (kind) {   // OPPO
+                0 -> tri(canvas, cx, cy, r, false, r * 0.24f)
+                1 -> { stroke(r * 0.24f); canvas.drawCircle(cx, cy, r, p) }
+                else -> square(canvas, cx, cy, r, false, r * 0.24f, r * 0.3f)
+            }
         }
     }
 }
@@ -647,7 +1000,7 @@ class SearchButton(c: Context) : View(c) {
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        p.color = Colors.text(context)
+        p.color = barFg()
         p.strokeWidth = context.dp(2).toFloat()
         val r = minOf(width, height) * 0.17f
         val cx = width / 2f - r * 0.18f

@@ -38,8 +38,11 @@ object Thumbs {
         return try { f.readLines().getOrNull(1)?.let { File(it) } ?: f } catch (_: Exception) { f }
     }
 
+    /** A shortcut gets the little arrow so it can be told from the real file. */
+    private fun badged(f: File, d: Drawable): Drawable = if (f.extension == "desktoplink") ShortcutBadged(d) else d
+
     private fun adaptive(res: Resources, bmp: Bitmap, bg: Int): Drawable =
-        AdaptiveIconDrawable(ColorDrawable(bg), BitmapDrawable(res, bmp))
+        Compat.adaptive(ColorDrawable(bg), BitmapDrawable(res, bmp))
 
     /** Shows the normal file icon right away, then swaps in a thumbnail when the file is a picture or video. */
     fun bind(iv: ImageView, f: File, px: Int) {
@@ -54,24 +57,24 @@ object Thumbs {
         val ext = f.extension.lowercase()
         if (ext != "desktoplink" && ext !in IMG && ext !in VID) return
         val res = iv.resources
-        cache.get(key)?.let { iv.setImageDrawable(adaptive(res, it, bgC)); return }
+        cache.get(key)?.let { iv.setImageDrawable(badged(f, adaptive(res, it, bgC))); return }
         val layer = (px * 1.5f).toInt().coerceAtLeast(2)
         ex.execute {
             val t = target(f)
             val te = t.extension.lowercase()
             val bmp = try {
                 if (!t.exists()) null
-                else if (te in IMG) ThumbnailUtils.createImageThumbnail(t, Size(layer, layer), null)
-                else if (te in VID) ThumbnailUtils.createVideoThumbnail(t, Size(layer, layer), null)
+                else if (te in IMG) Compat.thumbImage(t, layer)
+                else if (te in VID) Compat.thumbVideo(t, layer)
                 else null
             } catch (_: Throwable) { null }
             if (bmp != null) {
                 val vid = te in VID
                 val out = if (vid) filmFrame(bmp, layer, px, bgC, fgC) else photoFrame(bmp, layer, px)
                 cache.put(key, out)
-                main.post { if (iv.tag == key) iv.setImageDrawable(adaptive(res, out, bgC)) }
+                main.post { if (iv.tag == key) iv.setImageDrawable(badged(f, adaptive(res, out, bgC))) }
             } else if (t != f) {
-                main.post { if (iv.tag == key) iv.setImageDrawable(Icons.file(t)) }
+                main.post { if (iv.tag == key) iv.setImageDrawable(badged(f, Icons.fileOf(t))) }
             }
         }
     }
@@ -161,7 +164,7 @@ object Thumbs {
     }
 
     private fun imageOf(f: File, px: Int): Bitmap? {
-        try { return ThumbnailUtils.createImageThumbnail(f, Size(px, px), null) } catch (_: Throwable) {}
+        if (android.os.Build.VERSION.SDK_INT >= 29) try { return ThumbnailUtils.createImageThumbnail(f, Size(px, px), null) } catch (_: Throwable) {}
         return try {
             val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
             android.graphics.BitmapFactory.decodeFile(f.absolutePath, o)
@@ -172,7 +175,7 @@ object Thumbs {
     }
 
     private fun videoOf(f: File, px: Int): Bitmap? {
-        try { return ThumbnailUtils.createVideoThumbnail(f, Size(px, px), null) } catch (_: Throwable) {}
+        if (android.os.Build.VERSION.SDK_INT >= 29) try { return ThumbnailUtils.createVideoThumbnail(f, Size(px, px), null) } catch (_: Throwable) {}
         return try {
             val r = android.media.MediaMetadataRetriever()
             try { r.setDataSource(f.absolutePath); r.getFrameAtTime(0) } finally { r.release() }

@@ -164,24 +164,26 @@ object Icons {
     fun app(c: Context, comp: ComponentName, @Suppress("UNUSED_PARAMETER") themed: Boolean = false): Drawable {
         val on = Prefs.bool(c, Prefs.K_THEMED, false)
         val all = on && Prefs.bool(c, Prefs.K_THEMED_ALL, false)
-        val key = comp.flattenToString() + (if (on) (if (all) "#ta" else "#t") else "") + (if (Colors.night(c)) "n" else "d")
+        val shape = Prefs.getInt(c, Prefs.K_ICONSHAPE, 0)
+        val key = comp.flattenToString() + (if (on) (if (all) "#ta" else "#t") else "") + (if (Colors.night(c)) "n" else "d") + (if (shape != 0) "#s$shape" else "")
         cache[key]?.let { return it.newDrawable().mutate() }
         val d: Drawable = try {
             val base = c.packageManager.getActivityIcon(comp)
             if (!on) base else {
                 var mono: Drawable? = null
-                if (Build.VERSION.SDK_INT >= 33 && base is AdaptiveIconDrawable) mono = base.monochrome
+                if (Build.VERSION.SDK_INT >= 33) mono = Compat.monochrome(base)
                 if (mono != null) {
                     val fg = mono.constantState?.newDrawable()?.mutate() ?: mono
                     fg.setTint(Colors.iconFg(c))
-                    AdaptiveIconDrawable(ColorDrawable(Colors.iconBg(c)), fg)
+                    Compat.adaptive(ColorDrawable(Colors.iconBg(c)), fg)
                 } else if (all) makeMono(c, base) else base
             }
         } catch (e: Exception) {
             c.packageManager.defaultActivityIcon
         }
-        d.constantState?.let { cache[key] = it }
-        return d
+        val out = if (shape != 0) IconShapes.wrap(d, shape) else d
+        out.constantState?.let { cache[key] = it }
+        return out
     }
 
     /**
@@ -192,7 +194,7 @@ object Icons {
         val n = 216
         val bmp = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
         val cv = Canvas(bmp)
-        val adaptive = base is AdaptiveIconDrawable
+        val adaptive = Compat.isAdaptive(base)
         if (adaptive) base.setBounds(0, 0, n, n)
         else { val m = (n * 0.19f).toInt(); base.setBounds(m, m, n - m, n - m) }
         base.draw(cv)
@@ -250,10 +252,13 @@ object Icons {
         }
         bmp.setPixels(px, 0, n, 0, 0, n, n)
         val out = android.graphics.drawable.BitmapDrawable(c.resources, bmp)
-        return if (adaptive) out else AdaptiveIconDrawable(ColorDrawable(plate), out)
+        return if (adaptive) out else Compat.adaptive(ColorDrawable(plate), out)
     }
 
-    fun file(f: File): Drawable =
+    /** The icon of a file; a shortcut (.desktoplink) carries the small arrow. */
+    fun file(f: File): Drawable = fileOf(f).let { if (f.extension == "desktoplink") ShortcutBadged(it) else it }
+
+    fun fileOf(f: File): Drawable =
         if (f.isDirectory) FolderIcon() else {
             val ext = f.extension.lowercase()
             val col = when (ext) {
@@ -325,7 +330,7 @@ object Files {
     const val AUTH = "com.android.desktoplauncher.files"
 
     fun root(c: Context): File {
-        val r = if (Environment.isExternalStorageManager()) File(Environment.getExternalStorageDirectory(), "Desktop")
+        val r = if (Compat.hasAllFiles(c)) File(Environment.getExternalStorageDirectory(), "Desktop")
         else File(c.getExternalFilesDir(null) ?: c.filesDir, "Desktop")
         r.mkdirs()
         return r
@@ -354,7 +359,13 @@ object Files {
         try { c.startActivity(i, Launch.options(c)) } catch (e: Exception) { c.toast("No app can open this file") }
     }
 
+    /** Folders open in Desktop Files (a new window each time); the system file picker is only the fallback. */
     fun openFolder(c: Context, f: File) {
+        try {
+            val i = Intent("com.android.desktopfiles.OPEN").setPackage("com.android.desktopfiles").putExtra("path", f.absolutePath)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NEW_DOCUMENT or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+            c.startActivity(i, Launch.options(c)); return
+        } catch (_: Exception) {}
         val ext = Environment.getExternalStorageDirectory().absolutePath
         if (!f.absolutePath.startsWith(ext)) { c.toast("Folder is private to the launcher: ${f.absolutePath}"); return }
         val rel = f.absolutePath.removePrefix(ext).trimStart('/')
@@ -407,6 +418,13 @@ object Launch {
     }
 
     private var hiddenOpen = false
+    private var hiddenErr: String? = null
+
+    /** Whether the hidden "launch in this windowing mode" call can be made (always true for a system app). */
+    fun winModeWorks(): Boolean {
+        unlockHidden()
+        return try { android.app.ActivityOptions::class.java.getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType); true } catch (_: Throwable) { false }
+    }
     /** Android hides some framework calls (here: asking for the freeform windowing mode). Lifts that restriction for this app. */
     private fun unlockHidden() {
         if (hiddenOpen) return
@@ -418,7 +436,44 @@ object Launch {
             val getRuntime = getDeclared.invoke(vm, "getRuntime", arrayOfNulls<Class<*>>(0)) as java.lang.reflect.Method
             val setEx = getDeclared.invoke(vm, "setHiddenApiExemptions", arrayOf<Class<*>>(Array<String>::class.java)) as java.lang.reflect.Method
             setEx.invoke(getRuntime.invoke(null), arrayOf("L"))
-        } catch (_: Throwable) { }
+        } catch (e: Throwable) { hiddenErr = e.toString() }
+    }
+
+    /** Plain-text report of everything the freeform launch depends on (shown in Settings > Windows). */
+    fun diagnose(c: Context): String {
+        val sb = StringBuilder()
+        fun line(k: String, v: Any?) { sb.append(k).append(": ").append(v).append('\n') }
+        line("Android SDK", Build.VERSION.SDK_INT)
+        line("Device", Build.MANUFACTURER + " " + Build.MODEL)
+        val pm = c.packageManager
+        line("Feature freeform windows", pm.hasSystemFeature("android.software.freeform_window_management"))
+        line("Feature picture-in-picture", pm.hasSystemFeature("android.software.picture_in_picture"))
+        for (k in listOf("enable_freeform_support", "force_resizable_activities", "freeform_window_management", "enable_non_resizable_multi_window", "force_desktop_mode_on_external_displays"))
+            line("Global $k", try { Settings.Global.getString(c.contentResolver, k) } catch (_: Throwable) { "?" })
+        line("WRITE_SECURE_SETTINGS", hasSecure(c))
+        line("System app (system partition)", SysTasks.isSystem(c))
+        line("REAL_GET_TASKS", SysTasks.hasRealTasks(c))
+        line("Task list from the system", SysTasks.tasks(c)?.let { it.size.toString() + " tasks: " + it.joinToString(", ") { t -> t.pkg + "#" + t.id + "/m" + t.mode } } ?: "not available (accessibility fallback in use)")
+        line("Root shell", RootSh.available())
+        line("Taskbar as navigation-bar window", NavWin.status)
+        line("Setting: open apps in freeform", Prefs.bool(c, Prefs.K_FREEFORM, false))
+        line("Setting: helper window", Prefs.bool(c, Prefs.K_FFHACK, false))
+        line("Helper window running", FreeformHackActivity.running())
+        hiddenOpen = false; hiddenErr = null
+        unlockHidden()
+        line("Hidden API unlock", if (hiddenErr == null) "no error" else hiddenErr)
+        try {
+            val o = android.app.ActivityOptions.makeBasic()
+            val m = o.javaClass.getMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
+            m.invoke(o, 5)
+            line("setLaunchWindowingMode(5)", "worked")
+        } catch (e: Throwable) { line("setLaunchWindowingMode(5)", e.toString()) }
+        try {
+            val o = android.app.ActivityOptions.makeBasic()
+            o.setLaunchBounds(sizeRect(c, 2))
+            line("setLaunchBounds", "worked, " + sizeRect(c, 2))
+        } catch (e: Throwable) { line("setLaunchBounds", e.toString()) }
+        return sb.toString()
     }
 
     /** Opens the invisible freeform helper window once (Taskbar's "freeform hack"), if the setting is on. */
@@ -464,19 +519,12 @@ object Launch {
     }
 
     fun app(c: Context, comp: ComponentName, size: Int? = null) {
-        // Activities belonging to this launcher (Trash, Settings, etc.) must be launched
-        // as explicit in-app components, not as HOME/launcher-category launches.
-        // CATEGORY_LAUNCHER + RESET_TASK_IF_NEEDED can make some desktop ROMs treat
-        // the activity as part of the default Home task and keep it fullscreen.
-        val intent = if (comp.packageName == c.packageName) {
-            Intent().setComponent(comp)
-        } else {
-            Intent(Intent.ACTION_MAIN)
-                .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setComponent(comp)
-                .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-        }
-        start(c, intent, size)
+        val ff = Prefs.bool(c, Prefs.K_FREEFORM, false) || size != null
+        if (ff) RootSh.probe()
+        if (ff && !winModeWorks() && RootSh.known()) { ensureFreeform(c); RootSh.startFreeform(comp); return }
+        if (ff) SysTasks.ensureFreeform(c, comp.packageName)
+        start(c, Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(comp)
+            .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED), size)
     }
 
     /** "Window size >" sub menu (Phone / Tablet / Desktop) for the menu of an app icon. */
@@ -524,11 +572,172 @@ object Launch {
 
 /** Space taken by system bars and the display cutout (punch hole), so content never goes under them. */
 object Insets {
-    fun of(ins: android.view.WindowInsets): android.graphics.Insets =
-        ins.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+    fun of(ins: android.view.WindowInsets): Ins {
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            val i = ins.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+            return Ins(i.left, i.top, i.right, i.bottom)
+        }
+        @Suppress("DEPRECATION") var l = ins.systemWindowInsetLeft
+        @Suppress("DEPRECATION") var t = ins.systemWindowInsetTop
+        @Suppress("DEPRECATION") var r = ins.systemWindowInsetRight
+        @Suppress("DEPRECATION") var b = ins.systemWindowInsetBottom
+        if (android.os.Build.VERSION.SDK_INT >= 28) ins.displayCutout?.let { l = maxOf(l, it.safeInsetLeft); t = maxOf(t, it.safeInsetTop); r = maxOf(r, it.safeInsetRight); b = maxOf(b, it.safeInsetBottom) }
+        return Ins(l, t, r, b)
+    }
 
-    fun safe(c: Context): android.graphics.Insets = try {
-        c.getSystemService(android.view.WindowManager::class.java).currentWindowMetrics.windowInsets
-            .getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
-    } catch (_: Exception) { android.graphics.Insets.NONE }
+    /** Side margins to keep clear of the punch hole / a side navigation bar (known from Android 11; older systems report none here). */
+    fun safe(c: Context): Ins = try {
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            val i = c.getSystemService(android.view.WindowManager::class.java).currentWindowMetrics.windowInsets
+                .getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+            Ins(i.left, i.top, i.right, i.bottom)
+        } else Ins.NONE
+    } catch (_: Exception) { Ins.NONE }
+}
+
+
+/** Icon shapes the user can pick: the adaptive icon's two layers are drawn through the chosen outline. */
+object IconShapes {
+    const val SYSTEM = 0
+    val names = listOf("System", "Circle", "Squircle", "Rounded square", "Square", "Teardrop", "Diamond", "Hexagon", "Flower", "Arch")
+
+    private fun roundedPolygon(pts: List<android.graphics.PointF>, radius: Float, out: android.graphics.Path) {
+        val n = pts.size
+        for (i in 0 until n) {
+            val p0 = pts[(i + n - 1) % n]; val p1 = pts[i]; val p2 = pts[(i + 1) % n]
+            fun toward(a: android.graphics.PointF, b: android.graphics.PointF): android.graphics.PointF {
+                val dx = b.x - a.x; val dy = b.y - a.y
+                val len = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                val t = minOf(radius, len / 2f) / len
+                return android.graphics.PointF(a.x + dx * t, a.y + dy * t)
+            }
+            val s = toward(p1, p0); val e = toward(p1, p2)
+            if (i == 0) out.moveTo(s.x, s.y) else out.lineTo(s.x, s.y)
+            out.quadTo(p1.x, p1.y, e.x, e.y)
+        }
+        out.close()
+    }
+
+    /** Draws shape [id] filling [r] into [out]. 0 (system) is drawn as a squircle where a preview is needed. */
+    fun build(id: Int, r: android.graphics.RectF, out: android.graphics.Path) {
+        out.reset()
+        val w = r.width(); val h = r.height(); val cx = r.centerX(); val cy = r.centerY()
+        when (id) {
+            1 -> out.addOval(r, android.graphics.Path.Direction.CW)
+            4 -> out.addRoundRect(r, w * 0.08f, h * 0.08f, android.graphics.Path.Direction.CW)
+            3 -> out.addRoundRect(r, w * 0.27f, h * 0.27f, android.graphics.Path.Direction.CW)
+            5 -> { val q = w / 2f; out.addRoundRect(r, floatArrayOf(q, q, 0f, 0f, q, q, q, q), android.graphics.Path.Direction.CW) }
+            6 -> roundedPolygon(listOf(android.graphics.PointF(cx, r.top), android.graphics.PointF(r.right, cy),
+                android.graphics.PointF(cx, r.bottom), android.graphics.PointF(r.left, cy)), w * 0.22f, out)
+            7 -> roundedPolygon((0 until 6).map { i ->
+                val a = Math.toRadians(60.0 * i - 90.0)
+                android.graphics.PointF(cx + (w / 2f) * Math.cos(a).toFloat(), cy + (h / 2f) * Math.sin(a).toFloat())
+            }, w * 0.12f, out)
+            8 -> {
+                for (i in 0..180) {
+                    val a = Math.PI * 2 * i / 180
+                    val k = 0.88f + 0.12f * Math.cos(8 * a).toFloat()
+                    val x = cx + (w / 2f) * k * Math.cos(a).toFloat(); val y = cy + (h / 2f) * k * Math.sin(a).toFloat()
+                    if (i == 0) out.moveTo(x, y) else out.lineTo(x, y)
+                }
+                out.close()
+            }
+            9 -> { val q = w / 2f; val s = w * 0.14f; out.addRoundRect(r, floatArrayOf(q, q, q, q, s, s, s, s), android.graphics.Path.Direction.CW) }
+            else -> {   // squircle (superellipse)
+                for (i in 0..120) {
+                    val a = Math.PI * 2 * i / 120
+                    val cs = Math.cos(a); val sn = Math.sin(a)
+                    val x = cx + (w / 2f) * Math.signum(cs).toFloat() * Math.pow(Math.abs(cs), 0.5).toFloat()
+                    val y = cy + (h / 2f) * Math.signum(sn).toFloat() * Math.pow(Math.abs(sn), 0.5).toFloat()
+                    if (i == 0) out.moveTo(x, y) else out.lineTo(x, y)
+                }
+                out.close()
+            }
+        }
+    }
+
+    fun wrap(d: android.graphics.drawable.Drawable, id: Int): android.graphics.drawable.Drawable {
+        Compat.layers(d)?.let { return ShapedIcon(it.first, it.second, id) }
+        if (d is android.graphics.drawable.BitmapDrawable && d.intrinsicWidth == 216) return d   // a ready-made themed picture
+        // an old-style icon: a white plate in the chosen shape with the picture on it
+        val inset = android.graphics.drawable.InsetDrawable(d, 0.29f)
+        return ShapedIcon(android.graphics.drawable.ColorDrawable(0xFFFFFFFF.toInt()), inset, id)
+    }
+}
+
+class ShapedIcon(private val bg: android.graphics.drawable.Drawable, private val fg: android.graphics.drawable.Drawable, private val id: Int) :
+    android.graphics.drawable.Drawable() {
+    private val path = android.graphics.Path()
+
+    override fun onBoundsChange(b: android.graphics.Rect) {
+        // adaptive layers are 1.5 times the visible area
+        val dx = (b.width() * 0.25f).toInt(); val dy = (b.height() * 0.25f).toInt()
+        val r = android.graphics.Rect(b.left - dx, b.top - dy, b.right + dx, b.bottom + dy)
+        bg.bounds = r; fg.bounds = r
+        IconShapes.build(id, android.graphics.RectF(b), path)
+    }
+
+    override fun draw(c: android.graphics.Canvas) {
+        val s = c.save()
+        c.clipPath(path)
+        bg.draw(c); fg.draw(c)
+        c.restoreToCount(s)
+    }
+
+    override fun setAlpha(a: Int) { bg.alpha = a; fg.alpha = a }
+    override fun setColorFilter(f: android.graphics.ColorFilter?) { bg.colorFilter = f; fg.colorFilter = f }
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
+    override fun getIntrinsicWidth() = (108 * android.content.res.Resources.getSystem().displayMetrics.density).toInt()
+    override fun getIntrinsicHeight() = intrinsicWidth
+
+    override fun getConstantState(): ConstantState? {
+        val b = bg.constantState ?: return null
+        val f = fg.constantState ?: return null
+        val shape = id
+        return object : ConstantState() {
+            override fun newDrawable(): android.graphics.drawable.Drawable = ShapedIcon(b.newDrawable(), f.newDrawable(), shape)
+            override fun getChangingConfigurations() = 0
+        }
+    }
+}
+
+/** Name to show for a file: a shortcut (.desktoplink) is shown without its ending. */
+fun File.shown(): String = if (extension == "desktoplink") name.removeSuffix(".desktoplink") else name
+
+/** Draws [inner] with the "shortcut" arrow badge in the bottom-left corner. */
+class ShortcutBadged(private val inner: Drawable) : Drawable() {
+    private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val fg = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+    private val path = android.graphics.Path()
+
+    override fun onBoundsChange(b: android.graphics.Rect) { inner.bounds = b }
+    override fun getIntrinsicWidth() = inner.intrinsicWidth
+    override fun getIntrinsicHeight() = inner.intrinsicHeight
+
+    override fun draw(c: Canvas) {
+        inner.draw(c)
+        val b = bounds
+        val s = minOf(b.width(), b.height()).toFloat()
+        val r = s * 0.17f
+        val cx = b.left + r + s * 0.05f
+        val cy = b.bottom - r - s * 0.05f
+        bg.style = Paint.Style.FILL
+        bg.color = 0x40000000
+        c.drawCircle(cx, cy + s * 0.012f, r + s * 0.012f, bg)
+        bg.color = 0xFFFFFFFF.toInt()
+        c.drawCircle(cx, cy, r, bg)
+        fg.color = 0xFF263238.toInt()
+        fg.strokeWidth = s * 0.05f
+        val a = r * 0.5f
+        path.reset()
+        path.moveTo(cx - a, cy + a); path.lineTo(cx + a, cy - a)
+        path.moveTo(cx - a * 0.05f, cy - a); path.lineTo(cx + a, cy - a); path.lineTo(cx + a, cy + a * 0.05f)
+        c.drawPath(path, fg)
+    }
+
+    override fun setAlpha(alpha: Int) { inner.alpha = alpha }
+    override fun setColorFilter(cf: android.graphics.ColorFilter?) { inner.colorFilter = cf }
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
 }

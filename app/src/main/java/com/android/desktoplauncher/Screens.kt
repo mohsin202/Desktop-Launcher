@@ -43,6 +43,10 @@ object Cats {
     private const val K_FREEPAGE = "allfree"  // "1" = the first page of All is the user's own layout page
     private const val K_HIDECATS = "hidecats" // screens hidden from the home screen
 
+    /** One screen mode: only All and the user's own screens are shown; the automatic ones are hidden. */
+    fun oneScreen(c: Context) = Prefs.bool(c, "oneScreen", false)
+    fun shownInMode(c: Context, id: String) = !oneScreen(c) || id == DISCOVER || id == ALL || isCustom(id)
+
     fun hasFree(c: Context) = Prefs.getStr(c, K_FREEPAGE) == "1"
     fun isHidden(c: Context, id: String) = id in Prefs.list(c, K_HIDECATS)
     fun setHidden(c: Context, id: String, hidden: Boolean) {
@@ -102,7 +106,7 @@ object Cats {
     }
 
     private val titles = mapOf(
-        DISCOVER to "Discover", ALL to "All", WIDGETS to "Widgets", APPS to "Apps", MEDIA to "Photos & Videos",
+        DISCOVER to "Feed", ALL to "All", WIDGETS to "Widgets", APPS to "Apps", MEDIA to "Photos & Videos",
         SHORTCUTS to "Shortcuts", FOLDERS to "Folders", FILES to "Files"
     )
     private val mediaExt = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "svg", "mp4", "mkv", "webm", "3gp", "avi", "mov", "m4v")
@@ -201,8 +205,12 @@ object Screens {
 }
 
 /** Rounded button: category name, or dots (current page dark). */
-class CatPill(ctx: Context, private val wDp: Int, private val hDp: Int, private val bgColor: () -> Int) : View(ctx) {
+class CatPill(ctx: Context, private val wDp: Int, private val hDp: Int,
+              /** Thin outline colour, or null for none. */ private val outline: (() -> Int)? = null,
+              /** Text colour override, or null for the normal one. */ private val ink: (() -> Int?)? = null,
+              private val bgColor: () -> Int) : View(ctx) {
     private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val ol = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val l: () -> Unit = { invalidate() }
@@ -225,6 +233,12 @@ class CatPill(ctx: Context, private val wDp: Int, private val hDp: Int, private 
             bg.color = if (Blur.on(context)) (base and 0x00FFFFFF) or 0xA0000000.toInt() else base
             canvas.drawRoundRect(0f, 0f, w, h, h / 2f, h / 2f, bg)
         }
+        outline?.let {
+            ol.color = it()
+            ol.strokeWidth = context.dp(1).toFloat() * 1.4f
+            val half = ol.strokeWidth / 2f
+            canvas.drawRoundRect(half, half, w - half, h - half, h / 2f, h / 2f, ol)
+        }
         val fg = Colors.iconFg(context)
         if (Screens.dots && Screens.pages > 0) {
             val n = Screens.pages
@@ -237,7 +251,7 @@ class CatPill(ctx: Context, private val wDp: Int, private val hDp: Int, private 
                 x += step
             }
         } else {
-            tp.color = Colors.text(context)
+            tp.color = ink?.invoke() ?: Colors.text(context)
             tp.textSize = h * 0.5f
             val s = TextUtils.ellipsize(Screens.name, android.text.TextPaint(tp), w - h * 0.6f, TextUtils.TruncateAt.END).toString()
             canvas.drawText(s, w / 2f, h / 2f - (tp.ascent() + tp.descent()) / 2f, tp)
@@ -438,7 +452,15 @@ class CatMenu(private val act: LauncherActivity, private val desk: DesktopView, 
             desk.refresh()
             show()
         }
-        row.addView(plus, LinearLayout.LayoutParams(act.dp(52), act.dp(52)).also {
+        val side = LinearLayout(act)
+        side.orientation = LinearLayout.VERTICAL
+        side.gravity = Gravity.CENTER_HORIZONTAL
+        side.addView(plus, LinearLayout.LayoutParams(act.dp(52), act.dp(52)))
+        val one = Cats.oneScreen(act)
+        val mode = pill(UiText.text(act, if (one) "Category mode" else "One screen mode"))
+        mode.setOnClickListener { desk.setOneScreen(!one); show() }
+        side.addView(mode, LinearLayout.LayoutParams(WRAP, WRAP).also { it.topMargin = act.dp(10) })
+        row.addView(side, LinearLayout.LayoutParams(WRAP, WRAP).also {
             it.gravity = Gravity.CENTER_VERTICAL; it.marginStart = act.dp(10); it.marginEnd = act.dp(6)
         })
         hs.addView(row)
@@ -473,7 +495,18 @@ class CatMenu(private val act: LauncherActivity, private val desk: DesktopView, 
             n.setOnClickListener { desk.goTo(cat, i); closer() }
             if (own) {
                 tv.setOnLongClickListener {
-                    PopupMenuX(act, this).show(tvX(tv), tvY(tv), listOf(MenuItem("Delete page") { Cats.deleteFree(act); desk.refresh(); show() }))
+                    PopupMenuX(act, this).show(tvX(tv), tvY(tv), listOf(MenuItem("Delete page") {
+                        confirmDelete { desk.deleteFreePage(); show() }
+                    }))
+                    true
+                }
+                n.setOnLongClickListener { tv.performLongClick(); true }
+            } else if (cat == Cats.WIDGETS && desk.pageCount(cat) > 1) {
+                val pi = i
+                tv.setOnLongClickListener {
+                    PopupMenuX(act, this).show(tvX(tv), tvY(tv), listOf(MenuItem("Delete page") {
+                        confirmDelete { desk.deleteWidgetPage(pi); show() }
+                    }))
                     true
                 }
                 n.setOnLongClickListener { tv.performLongClick(); true }
@@ -505,6 +538,14 @@ class CatMenu(private val act: LauncherActivity, private val desk: DesktopView, 
         card.addView(hs, LinearLayout.LayoutParams(MATCH, WRAP))
         val target = cur
         if (target != null) hs.post { target.requestRectangleOnScreen(Rect(0, 0, target.width, target.height), true) }
+    }
+
+    private fun confirmDelete(go: () -> Unit) {
+        android.app.AlertDialog.Builder(act)
+            .setMessage(UiText.text(act, "Delete this page with all icons and widgets on it?"))
+            .setPositiveButton(UiText.text(act, "Delete")) { _, _ -> go() }
+            .setNegativeButton(UiText.text(act, "Cancel"), null)
+            .show()
     }
 
     private fun tvX(v: View): Int { val l = IntArray(2); v.getLocationOnScreen(l); return l[0] + v.width / 2 }
